@@ -2,6 +2,7 @@
 
 package ai.respondo.sdk.realtime
 
+import ai.respondo.sdk.core.SurveyTargeting
 import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -25,6 +26,10 @@ data class IdentifyFrame(
     @SerialName("user_hash") val userHash: String? = null,
     val lang: String? = null,
     @SerialName("conversation_id") val conversationId: String? = null,
+    /** Возможности клиента: SDK сам исполняет таргетинг опросов — серверу можно пушить таргетированные. */
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS) val features: List<String> = listOf(SurveyTargeting.FEATURE),
+    /** Где работает клиент: опрос «только сайт» приложению не пушится. */
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS) val platform: String = SurveyTargeting.CLIENT_PLATFORM,
     @EncodeDefault(EncodeDefault.Mode.ALWAYS) val type: String = "identify",
 )
 

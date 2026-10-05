@@ -12,6 +12,7 @@ sealed interface QueuedCommand {
     data object Close : QueuedCommand
     data object OpenNews : QueuedCommand
     data object OpenChecklists : QueuedCommand
+    data class StartSurvey(val surveyId: String) : QueuedCommand
     data class SetPushToken(val token: String) : QueuedCommand
     data object ClearPushToken : QueuedCommand
     data class HandlePush(val payload: RespondoPushPayload) : QueuedCommand

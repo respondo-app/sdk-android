@@ -40,6 +40,13 @@ data class QuestionDto(
     val required: Boolean = false,
 )
 
+/** Правило экрана опроса (backend domain/pageurl.Rule). */
+@Serializable
+data class PageRuleDto(
+    val op: String,
+    val value: String? = null,
+)
+
 /**
  * Контент outbound-кампании (подмножество полей, релевантных каталогам survey/banner).
  * Бэкенд может добавлять другие поля (additionalProperties=true) — они игнорируются парсером.
@@ -55,6 +62,11 @@ data class OutboundContentDto(
     @SerialName("show_intro_screen") val showIntroScreen: Boolean = false,
     @SerialName("show_dismiss") val showDismiss: Boolean? = null,
     @SerialName("show_progress") val showProgress: Boolean = false,
+    // Таргетинг оверлей-опроса для приложений (survey_url_rules — только веб, SDK их не читает намеренно).
+    @SerialName("survey_platform") val surveyPlatform: String? = null,
+    @SerialName("survey_screen_rules") val surveyScreenRules: List<PageRuleDto> = emptyList(),
+    @SerialName("survey_delay_seconds") val surveyDelaySeconds: Int? = null,
+    @SerialName("survey_trigger_event") val surveyTriggerEvent: String? = null,
     @SerialName("banner_link_label") val bannerLinkLabel: String? = null,
     @SerialName("banner_bg") val bannerBg: String? = null,
     @SerialName("banner_fg") val bannerFg: String? = null,

@@ -88,7 +88,7 @@ internal class RespondoController(
     private val pushManager = PushManager(apiClient, PushHostImpl(), scope)
 
     /** Engagement-слой (news/surveys/banners/checklists/proactive). UI и фасад читают его наблюдаемые. */
-    internal val engagement = EngagementController(apiClient, EngagementHostImpl(), scope)
+    internal val engagement = EngagementController(apiClient, EngagementHostImpl(), scope, store)
 
     // --- наблюдаемое состояние ---
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
@@ -339,13 +339,25 @@ internal class RespondoController(
     fun setListener(l: RespondoListener?) { listener = l }
 
     fun setCurrentScreen(name: String?) {
+        val changed = device.screen != name
         device.screen = name
+        // Таргетинг опросов по экрану: новый экран — правила перечитываются.
+        if (changed) engagement.screenDidChange()
         // Смена экрана приложения — аналог SPA-навигации: перепланировать проактив.
         if (_theme.value.proactiveEnabled) engagement.scheduleProactive(_theme.value.proactiveDelaySeconds)
     }
 
     fun identify(identity: RespondoIdentity) {
+        // Личность заменяется целиком (api-surface.md §3.3): поле, не переданное в identify(),
+        // сбрасывается — так же на вебе, в iOS и Flutter.
+        val prevKey = ControllerLogic.contactKey(identityStore.currentIdentity())
         identityStore.setIdentity(identity)
+        // Другой контакт: опросы и доставки прежнего (и его запросы в полёте) ему не достаются;
+        // события сессии прежнего пользователя — тоже, если он не был анонимом
+        // (аноним → пользователь — тот же человек).
+        if (prevKey != ControllerLogic.contactKey(identity)) {
+            engagement.identityChanged(fromAnonymous = prevKey.first == null && prevKey.second == null)
+        }
         // Устройство — к контакту новой личности: токен, полученный до логина,
         // иначе навсегда оставался на анонимном контакте визитёра.
         pushManager.reRegister()
@@ -372,7 +384,12 @@ internal class RespondoController(
                 ),
             )
         }
+        // Событие-триггер оверлей-опроса срабатывает сразу, без сетевого круга.
+        engagement.eventTracked(name)
     }
+
+    /** Открыть оверлей-опрос по id (из редактора опроса, «Additional ways to share»). */
+    fun startSurvey(surveyId: String) = engagement.startSurvey(surveyId)
 
     fun open() {
         _surface.value = ChatSurface.CHAT
@@ -749,9 +766,18 @@ internal class RespondoController(
             is RealtimeEvent.CampaignConversation -> onCampaignConversation(event.conversationId, event.message)
             is RealtimeEvent.Subscribed -> RespondoLog.d("subscribed ${event.conversationId}")
             is RealtimeEvent.Error -> onRealtimeError(event.message)
-            is RealtimeEvent.OverlayShow -> engagement.applyOverlayItems(event.items)
+            is RealtimeEvent.OverlayShow -> applyOverlayShow(event)
             is RealtimeEvent.Ignored -> Unit // tooltip.catalog / tour.catalog / неизвестный type
         }
+    }
+
+    /** Кадр `overlay.show` → engagement-слой, только если посчитан для текущего контакта. */
+    internal fun applyOverlayShow(event: RealtimeEvent.OverlayShow) {
+        if (!ControllerLogic.acceptsOverlayFrame(event.contact, identityStore.currentIdentity())) {
+            RespondoLog.d("overlay.show for another contact dropped")
+            return
+        }
+        engagement.applyOverlayItems(event.items)
     }
 
     private suspend fun onNewMessageEvent(dto: MessageDto) {

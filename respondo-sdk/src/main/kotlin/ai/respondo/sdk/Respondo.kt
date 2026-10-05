@@ -128,6 +128,14 @@ object Respondo {
     @JvmStatic
     fun openChecklists() = dispatch(QueuedCommand.OpenChecklists) { it.openChecklists() }
 
+    /**
+     * Открыть оверлей-опрос сейчас, на любом экране — id опроса из редактора («Open it from your
+     * code»). Правила экранов, задержка, событие и аудитория не проверяются; опрос должен быть
+     * запущен, и отвеченный повторно не показывается. Вызов до `init` буферизуется.
+     */
+    @JvmStatic
+    fun startSurvey(surveyId: String) = dispatch(QueuedCommand.StartSurvey(surveyId)) { it.startSurvey(surveyId) }
+
     /** Закрыть проактив-тизер под текущим экраном (host-приложение скрыло пузырь без открытия чата). */
     @JvmStatic
     fun dismissProactive() {
@@ -224,6 +232,7 @@ object Respondo {
             QueuedCommand.Close -> c.close()
             QueuedCommand.OpenNews -> c.openNews()
             QueuedCommand.OpenChecklists -> c.openChecklists()
+            is QueuedCommand.StartSurvey -> c.startSurvey(command.surveyId)
             is QueuedCommand.SetPushToken -> c.setPushToken(command.token)
             QueuedCommand.ClearPushToken -> c.clearPushToken()
             is QueuedCommand.HandlePush -> c.handlePush(command.payload)

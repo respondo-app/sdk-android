@@ -1,5 +1,6 @@
 package ai.respondo.sdk.realtime
 
+import ai.respondo.sdk.core.ControllerLogic
 import ai.respondo.sdk.internal.RespondoLog
 import ai.respondo.sdk.internal.respondoJson
 import ai.respondo.sdk.transport.dto.MessageDto
@@ -28,8 +29,11 @@ sealed interface RealtimeEvent {
     /** Точечное изменение существующего сообщения (delivery_status/ошибка). Частичный объект, обновляется по id. */
     data class MessageUpdated(val conversationId: String, val update: MessageUpdateDto) : RealtimeEvent
 
-    /** Оверлеи для контакта (engagement-слой Ф3). В чат-ядре игнорируются. */
-    data class OverlayShow(val items: List<JsonObject>) : RealtimeEvent
+    /**
+     * Оверлеи для контакта (engagement-слой Ф3). В чат-ядре игнорируются. [contact] — ключ контакта
+     * из штампа `data.identity` (для кого сервер их посчитал), `null` — кадр без штампа.
+     */
+    data class OverlayShow(val items: List<JsonObject>, val contact: Pair<String?, String?>?) : RealtimeEvent
 
     /** In-thread кампания, доставленная в беседу (адопция беседы + бейдж). */
     data class CampaignConversation(val conversationId: String, val message: MessageDto?) : RealtimeEvent
@@ -97,7 +101,10 @@ object WsParser {
                 val data = obj["data"] as? JsonObject
                 val items = (data?.get("items") as? kotlinx.serialization.json.JsonArray)
                     ?.mapNotNull { it as? JsonObject } ?: emptyList()
-                RealtimeEvent.OverlayShow(items)
+                val contact = (data?.get("identity") as? JsonObject)?.let {
+                    ControllerLogic.contactKey(it.str("user_id"), it.str("email"))
+                }
+                RealtimeEvent.OverlayShow(items, contact)
             }
 
             "campaign_conversation" -> {

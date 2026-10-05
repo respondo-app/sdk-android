@@ -1,5 +1,6 @@
 package ai.respondo.sdk.core
 
+import ai.respondo.sdk.internal.KeyValueStore
 import ai.respondo.sdk.internal.RespondoLog
 import ai.respondo.sdk.transport.ApiClient
 import ai.respondo.sdk.transport.AuthParams
@@ -62,6 +63,10 @@ internal class EngagementController(
     private val apiClient: ApiClient,
     private val host: EngagementHost,
     private val scope: CoroutineScope,
+    /** Хранилище SDK: закрытые опросы переживают перезапуск ([SurveyDismissals]). */
+    store: KeyValueStore,
+    /** Часы для таргетинга опросов (мс); в тестах — виртуальное время планировщика. */
+    private val clock: () -> Long = System::currentTimeMillis,
 ) {
     // --- наблюдаемое состояние (UI) ---
     private val _news = MutableStateFlow<List<RespondoNewsItem>>(emptyList())
@@ -114,13 +119,34 @@ internal class EngagementController(
     private var pendingProactive: RespondoProactiveMessage? = null
     private var proactiveJob: Job? = null
 
+    // «Когда и где» опросов (SurveyTargeting): когда открыт текущий экран, какие события-триггеры
+    // были в этой сессии и ещё не открыли опрос (живут EVENT_TTL_MS, смена экрана их не забывает),
+    // таймер ближайшей задержки, опросы, которые сейчас открываются (минт доставки), и те, что
+    // сервер открыть отказался. Под stateLock.
+    private var screenSinceMs = clock()
+    private val trackedEvents = HashMap<String, Long>()
+    private var delayJob: Job? = null
+    private val openingSurveys = HashSet<String>()
+    private val refusedSurveys = HashSet<String>()
+    /** Кампании, открытые явно (`startSurvey`): идут первыми, мимо правил. */
+    private val explicitSurveys = mutableListOf<String>()
+    /** Закрытые посетителем доставки опросов — в хранилище, как `respondo_survey_seen_*` веба. */
+    private val surveyDismissals = SurveyDismissals(store)
+
+    // Поколение контакта: [clear] (logout/reset) его повышает, и сетевой ответ, запрошенный для
+    // прежнего контакта, отбрасывается — его опрос и доставка не достаются новому. Запросы
+    // каталога и минта ещё и отменяются ([surveyJobs]). Под stateLock.
+    private var generation = 0
+    private val surveyJobs = HashSet<Job>()
+
     // ==================== каталоги overlay (surveys + banners) ====================
 
     /** Грузит каталоги опросов и баннеров (на identify / overlay.show). */
     fun loadCatalogs() {
         val params = host.engagementParams()
         val auth = authParams(params)
-        scope.launch {
+        val gen = synchronized(stateLock) { generation }
+        trackSurveyJob {
             val surveysDto = runCatching {
                 apiClient.getSurveys(params.agentId, params.channelId, null, auth, params.email, params.userId)
             }.getOrNull()
@@ -128,7 +154,16 @@ internal class EngagementController(
                 apiClient.getBanners(params.agentId, params.channelId, null, auth, params.email, params.userId)
             }.getOrNull()
             synchronized(stateLock) {
-                surveysDto?.let { surveys = it.surveys.map(EngagementMapper::toSurvey) }
+                if (gen != generation) return@trackSurveyJob
+                surveysDto?.let { dto ->
+                    // Таргетированный опрос в каталоге всегда без доставки: уже открытый (минт по
+                    // survey_id) не затираем его пустой копией.
+                    val opened = surveys.filter { it.deliveryId.isNotEmpty() }
+                    surveys = dto.surveys.map(EngagementMapper::toSurvey).map { survey ->
+                        if (survey.deliveryId.isNotEmpty()) survey
+                        else opened.firstOrNull { it.campaignId == survey.campaignId } ?: survey
+                    }
+                }
                 bannersDto?.let {
                     bannerList = it.banners.map(EngagementMapper::toBanner)
                     publishBanners()
@@ -158,8 +193,15 @@ internal class EngagementController(
                             ai.respondo.sdk.transport.dto.SurveyCatalogItemDto.serializer(), item,
                         )
                     }.getOrNull() ?: continue
+                    // По кампании, а не по доставке: таргетированный опрос приходит без доставки,
+                    // и повторный пуш не должен затирать уже открытый.
                     val survey = EngagementMapper.toSurvey(dto)
-                    if (newSurveys.none { it.deliveryId == survey.deliveryId }) newSurveys.add(survey)
+                    val index = newSurveys.indexOfFirst { it.campaignId == survey.campaignId }
+                    if (index < 0) {
+                        newSurveys.add(survey)
+                    } else if (newSurveys[index].deliveryId.isEmpty()) {
+                        newSurveys[index] = survey
+                    }
                 } else if (isBanner) {
                     val dto = runCatching {
                         ai.respondo.sdk.internal.respondoJson.decodeFromJsonElement(
@@ -349,6 +391,8 @@ internal class EngagementController(
     fun dismissSurvey(deliveryId: String) {
         synchronized(stateLock) {
             dismissed.add(deliveryId)
+            surveyDismissals.add(deliveryId)
+            surveys.firstOrNull { it.deliveryId == deliveryId }?.let { explicitSurveys.remove(it.campaignId) }
             resetSurveyProgress()
             recomputeOverlay()
         }
@@ -359,6 +403,128 @@ internal class EngagementController(
         _surveyFinished.value = false
         _surveySubmitting.value = false
         _surveyAnswers.value = emptyMap()
+    }
+
+    // ==================== Когда и где (таргетинг опросов) ====================
+
+    /**
+     * Хост сменил экран (`setCurrentScreen`): правила перечитываются для нового экрана, время на
+     * экране начинается заново. События сессии остаются — `track` перед переходом на экран опроса
+     * его откроет. Показанный опрос остаётся — он следует за посетителем.
+     */
+    fun screenDidChange() {
+        synchronized(stateLock) {
+            screenSinceMs = clock()
+            recomputeOverlay()
+        }
+    }
+
+    /** `Respondo.track(name)`: опрос с таким событием-триггером открывается сразу (после своей задержки). */
+    fun eventTracked(name: String) {
+        val canon = SurveyTargeting.normalizeEventName(name)
+        if (canon.isEmpty()) return
+        synchronized(stateLock) {
+            trackedEvents[canon] = clock()
+            recomputeOverlay()
+        }
+    }
+
+    /**
+     * Открыть опрос по id кампании прямо сейчас (`Respondo.startSurvey`): мимо правил экранов,
+     * задержки, события и аудитории; расписание, канал и уже данный ответ сервер проверяет.
+     */
+    fun startSurvey(campaignId: String) {
+        val id = campaignId.trim()
+        if (id.isEmpty()) return
+        synchronized(stateLock) {
+            if ((_activeOverlay.value as? OverlayDecision.Survey)?.survey?.campaignId == id) return
+            openSurvey(id, explicit = true)
+        }
+    }
+
+    /** Минт доставки опроса, который решено показать: GET /widget/surveys?survey_id=. Под [stateLock]. */
+    private fun openSurvey(campaignId: String, explicit: Boolean) {
+        if (!openingSurveys.add(campaignId)) return
+        val params = host.engagementParams()
+        val auth = authParams(params)
+        val gen = generation
+        trackSurveyJob {
+            val dto = runCatching {
+                apiClient.getSurveys(
+                    params.agentId, params.channelId, null, auth, params.email, params.userId,
+                    surveyId = campaignId, explicit = explicit,
+                )
+            }.getOrNull()?.surveys?.firstOrNull()?.takeIf { it.deliveryId.isNotEmpty() }
+            synchronized(stateLock) {
+                // Контакт сменился, пока шёл запрос: опрос и доставка — прежнего контакта.
+                if (gen != generation) return@trackSurveyJob
+                openingSurveys.remove(campaignId)
+                if (dto == null) {
+                    // Сервер отказал (аудитория, расписание, уже отвечен): на этом запуске больше не спрашиваем.
+                    if (!explicit) refusedSurveys.add(campaignId)
+                    recomputeOverlay()
+                    return@trackSurveyJob
+                }
+                val survey = EngagementMapper.toSurvey(dto)
+                // Событие, открывшее опрос, израсходовано: один track — один показ.
+                if (!explicit) {
+                    surveys.firstOrNull { it.campaignId == campaignId }?.targeting?.triggerEvent
+                        ?.let { trackedEvents.remove(it) }
+                }
+                val index = surveys.indexOfFirst { it.campaignId == campaignId }
+                surveys = if (index < 0) surveys + survey else surveys.mapIndexed { i, s -> if (i == index) survey else s }
+                if (explicit) {
+                    // Явный запуск показывает опрос снова, даже если его закрывали.
+                    dismissed.remove(survey.deliveryId)
+                    surveyDismissals.remove(survey.deliveryId)
+                    if (campaignId !in explicitSurveys) explicitSurveys.add(campaignId)
+                }
+                recomputeOverlay()
+            }
+        }
+    }
+
+    /**
+     * Опросы, которые могут быть показаны прямо сейчас, в порядке приоритета: уже показанный
+     * (следует за посетителем), явно запрошенные, затем каталог по готовности. Попутно открывает
+     * готовые таргетированные опросы и ставит таймер ближайшей задержки. Под [stateLock].
+     */
+    private fun showableSurveys(): List<RespondoSurvey> {
+        delayJob?.cancel()
+        delayJob = null
+        val out = mutableListOf<RespondoSurvey>()
+        (_activeOverlay.value as? OverlayDecision.Survey)?.survey
+            ?.takeIf { !isDismissed(it.deliveryId) }
+            ?.let { out += it }
+        for (id in explicitSurveys) {
+            surveys.firstOrNull { it.campaignId == id && it.deliveryId.isNotEmpty() }?.let { out += it }
+        }
+        val now = clock()
+        SurveyTargeting.dropStaleEvents(trackedEvents, now)
+        val screen = host.engagementScreen()
+        var soonest: Long? = null
+        for (survey in surveys) {
+            if (survey.deliveryId.isNotEmpty() && isDismissed(survey.deliveryId)) continue
+            if (survey.campaignId in refusedSurveys) continue
+            // Доставка есть и посетитель опрос не закрывал — его уже открывали этому посетителю
+            // (может быть, до перезапуска): он продолжается на любом экране. Закрытый остаётся
+            // закрытым и после перезапуска (SurveyDismissals).
+            val resumed = survey.deliveryId.isNotEmpty()
+            when (val r = SurveyTargeting.readiness(survey.targeting, screen, screenSinceMs, trackedEvents, now, resumed)) {
+                SurveyTargeting.Readiness.Ready ->
+                    if (survey.deliveryId.isEmpty()) openSurvey(survey.campaignId, explicit = false) else out += survey
+                is SurveyTargeting.Readiness.Delay -> soonest = minOf(soonest ?: r.inMs, r.inMs)
+                SurveyTargeting.Readiness.Event, SurveyTargeting.Readiness.Elsewhere -> Unit
+            }
+        }
+        soonest?.let { wait ->
+            delayJob = scope.launch {
+                delay(wait + 50)
+                synchronized(stateLock) { recomputeOverlay() }
+            }
+        }
+        val seen = HashSet<String>()
+        return out.filter { seen.add(it.campaignId) }
     }
 
     // ==================== Banner ====================
@@ -469,6 +635,17 @@ internal class EngagementController(
 
     // ==================== служебное ====================
 
+    /** Доставка закрыта: на этом запуске или раньше (опрос — в [surveyDismissals]). Под [stateLock]. */
+    private fun isDismissed(deliveryId: String): Boolean =
+        dismissed.contains(deliveryId) || surveyDismissals.contains(deliveryId)
+
+    /** Запрос опросов прежнего контакта, который [clear] отменит. */
+    private fun trackSurveyJob(block: suspend CoroutineScope.() -> Unit) {
+        val job = scope.launch(block = block)
+        synchronized(stateLock) { surveyJobs.add(job) }
+        job.invokeOnCompletion { synchronized(stateLock) { surveyJobs.remove(job) } }
+    }
+
     /** Должно вызываться под [stateLock]. */
     private fun publishBanners() {
         _banners.value = bannerList.filter { !dismissed.contains(it.deliveryId) }
@@ -479,7 +656,7 @@ internal class EngagementController(
         val previous = _activeOverlay.value
         val decision = OverlayArbiter.decide(
             OverlayArbiterInput(
-                surveys = surveys,
+                surveys = showableSurveys(),
                 banners = bannerList,
                 dismissed = dismissed,
                 lightboxOpen = lightboxOpen,
@@ -487,7 +664,7 @@ internal class EngagementController(
             ),
         )
         val sameSurvey = decision is OverlayDecision.Survey && previous is OverlayDecision.Survey &&
-            decision.survey.deliveryId == previous.survey.deliveryId
+            decision.survey.campaignId == previous.survey.campaignId
         if (!sameSurvey && decision != previous) resetSurveyProgress()
         _activeOverlay.value = decision
     }
@@ -509,12 +686,49 @@ internal class EngagementController(
         }
     }
 
+    /**
+     * `identify()` сменил контакт (другой email или userId, в том числе аноним → пользователь):
+     * опросы и доставки прежнего контакта ему не достаются. Поколение растёт — каталог и минт,
+     * запрошенные для прежнего контакта, отбрасываются, даже если придут последними; открытые
+     * доставки, явные запуски и закрытия этого запуска забываются, каталог грузится заново
+     * ([loadCatalogs]). Закрытые доставки в хранилище остаются: id доставки свой у каждого
+     * контакта. Время на экране не трогается. События сессии ([eventTracked]) остаются только при
+     * смене аноним → пользователь (тот же человек вошёл); после другого пользователя (A → B) они
+     * забываются — `track()` пользователя A не открывает опрос пользователю B.
+     */
+    fun identityChanged(fromAnonymous: Boolean) {
+        synchronized(stateLock) {
+            dropContactState()
+            if (!fromAnonymous) trackedEvents.clear()
+            recomputeOverlay()
+        }
+        resetSurveyProgress()
+    }
+
+    /** Состояние опросов и баннеров, принадлежащее контакту. Под [stateLock]. */
+    private fun dropContactState() {
+        generation++
+        surveyJobs.toList().forEach { it.cancel() }
+        surveyJobs.clear()
+        openingSurveys.clear()
+        refusedSurveys.clear()
+        explicitSurveys.clear()
+        surveys = emptyList()
+        bannerList = emptyList()
+        dismissed.clear()
+        publishBanners()
+        _activeOverlay.value = OverlayDecision.None
+    }
+
     fun clear() {
         proactiveJob?.cancel()
         synchronized(stateLock) {
-            surveys = emptyList()
-            bannerList = emptyList()
-            dismissed.clear()
+            dropContactState()
+            delayJob?.cancel()
+            delayJob = null
+            trackedEvents.clear()
+            screenSinceMs = clock()
+            surveyDismissals.forget()
             startedChecklists.clear()
             dismissedProactiveScreens.clear()
             pendingProactive = null

@@ -13,6 +13,7 @@ import ai.respondo.sdk.core.RespondoBannerPosition
 import ai.respondo.sdk.core.RespondoChecklistAction
 import ai.respondo.sdk.core.RespondoSurvey
 import ai.respondo.sdk.core.RespondoSurveyAnswer
+import ai.respondo.sdk.internal.InMemoryKeyValueStore
 import ai.respondo.sdk.internal.respondoJson
 import ai.respondo.sdk.support.Fixtures
 import ai.respondo.sdk.support.FakeHttpEngine
@@ -185,7 +186,7 @@ class EngagementTest {
     @Test
     fun loadCatalogs_populatesSurveyOverlayAndBanners() = runTest {
         val engine = routingEngine()
-        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this)
+        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this, InMemoryKeyValueStore())
         controller.loadCatalogs()
         advanceUntilIdle()
         assertTrue(controller.activeOverlay.value is OverlayDecision.Survey)
@@ -195,7 +196,7 @@ class EngagementTest {
     @Test
     fun surveyFlow_answersEachStepThenSubmits() = runTest {
         val engine = routingEngine()
-        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this)
+        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this, InMemoryKeyValueStore())
         controller.loadCatalogs()
         advanceUntilIdle()
         val survey = controller.activeSurvey()!!
@@ -222,7 +223,7 @@ class EngagementTest {
     @Test
     fun checklists_startedThenTaskDone() = runTest {
         val engine = routingEngine()
-        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this)
+        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this, InMemoryKeyValueStore())
         controller.loadChecklists()
         advanceUntilIdle()
         assertEquals(1, controller.checklists.value.size)
@@ -239,7 +240,7 @@ class EngagementTest {
     fun checklists_urlTaskOpensUrl() = runTest {
         val engine = routingEngine()
         val host = TestEngagementHost()
-        val controller = EngagementController(ApiClient("https://api.test", engine), host, this)
+        val controller = EngagementController(ApiClient("https://api.test", engine), host, this, InMemoryKeyValueStore())
         controller.loadChecklists()
         advanceUntilIdle()
         controller.performTask("7a3b5c9d-1e6f-4a0b-c2d4-5e7f9a1b3c6d", "task-connect-inbox")
@@ -250,7 +251,7 @@ class EngagementTest {
     @Test
     fun news_markSeenDecrementsUnread() = runTest {
         val engine = routingEngine()
-        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this)
+        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this, InMemoryKeyValueStore())
         controller.loadNews()
         advanceUntilIdle()
         assertEquals(1, controller.newsUnread.value)
@@ -264,7 +265,7 @@ class EngagementTest {
     @Test
     fun banner_reactionPostsResponse() = runTest {
         val engine = routingEngine()
-        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this)
+        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this, InMemoryKeyValueStore())
         controller.loadCatalogs()
         advanceUntilIdle()
         val banner = controller.banners.value.first()
@@ -277,7 +278,7 @@ class EngagementTest {
     @Test
     fun proactive_204YieldsNothing() = runTest {
         val engine = routingEngine(proactiveCode = 204)
-        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this)
+        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this, InMemoryKeyValueStore())
         controller.scheduleProactive(0)
         advanceUntilIdle()
         assertNull(controller.proactive.value)
@@ -286,7 +287,7 @@ class EngagementTest {
     @Test
     fun proactive_200EmitsMessage() = runTest {
         val engine = routingEngine(proactiveCode = 200, proactiveBody = """{"message":"Need help checking out?","page_path":"/cart"}""")
-        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(chatOpen = false), this)
+        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(chatOpen = false), this, InMemoryKeyValueStore())
         controller.scheduleProactive(0)
         advanceUntilIdle()
         assertEquals("Need help checking out?", controller.proactive.value?.text)
@@ -295,7 +296,7 @@ class EngagementTest {
     @Test
     fun applyOverlayItems_classifiesSurveyAndBanner() = runTest {
         val engine = routingEngine()
-        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this)
+        val controller = EngagementController(ApiClient("https://api.test", engine), TestEngagementHost(), this, InMemoryKeyValueStore())
         controller.applyOverlayItems(listOf(surveyFixtureItem(), bannerFixtureItem()))
         advanceUntilIdle()
         assertTrue(controller.activeOverlay.value is OverlayDecision.Survey)

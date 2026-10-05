@@ -44,6 +44,13 @@ internal object EngagementMapper {
             steps = steps,
             questions = questions,
             sender = toSender(dto.fromSender),
+            targeting = RespondoSurveyTargeting(
+                screenRules = content.surveyScreenRules.map { RespondoScreenRule(it.op, it.value.orEmpty()) },
+                delaySeconds = SurveyTargeting.clampDelay(content.surveyDelaySeconds),
+                triggerEvent = SurveyTargeting.normalizeEventName(content.surveyTriggerEvent.orEmpty())
+                    .takeIf { it.isNotEmpty() },
+                showsInApps = SurveyTargeting.showsInApps(content.surveyPlatform),
+            ),
         )
     }
 

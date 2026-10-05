@@ -1,11 +1,35 @@
 package ai.respondo.sdk.core
 
+import ai.respondo.sdk.RespondoIdentity
+
 /**
  * Чистые решения оркестратора чата, вынесенные из [RespondoController] для детерминированного
  * юнит-тестирования (без Context, реалтайма и корутинного скоупа). Продакшн-путь вызывает ровно эти
  * функции — тест и рантайм используют одну и ту же логику.
  */
 internal object ControllerLogic {
+
+    /**
+     * Ключ контакта для `identify()`: userId и email (email без регистра, пробелы по краям не
+     * значимы). Смена ключа — другой контакт; name, user_hash и свойства контакт не меняют.
+     */
+    fun contactKey(identity: RespondoIdentity): Pair<String?, String?> = contactKey(identity.userId, identity.email)
+
+    /** Ключ контакта по сырым полям (из `identify()` или штампа `overlay.show` `data.identity`). */
+    fun contactKey(userId: String?, email: String?): Pair<String?, String?> = Pair(
+        userId?.trim()?.takeIf { it.isNotEmpty() },
+        email?.trim()?.lowercase()?.takeIf { it.isNotEmpty() },
+    )
+
+    /**
+     * Применять ли кадр `overlay.show` для текущей личности: только посчитанный для неё. Сокет
+     * переживает `identify()` (реидентификация на том же соединении), и кадр прежнего контакта,
+     * пришедший после `identify(B)`, иначе отдал бы B опросы и доставки A. Кадр без штампа
+     * (`frameContact == null`) тоже отбрасывается — каталог по HTTP знает, для кого запрошен
+     * (api-surface.md §3.3, как `survey-runtime.ts` на вебе).
+     */
+    fun acceptsOverlayFrame(frameContact: Pair<String?, String?>?, current: RespondoIdentity): Boolean =
+        frameContact != null && frameContact == contactKey(current)
 
     /** Состояние индикатора «печатает» по кадру typing: `is_typing=false` гасит индикатор. */
     fun typingState(isTyping: Boolean, authorName: String?): TypingState? =

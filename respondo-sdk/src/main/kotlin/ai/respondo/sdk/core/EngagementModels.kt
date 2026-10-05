@@ -56,6 +56,27 @@ data class RespondoQuestion(
     val required: Boolean,
 )
 
+/** Правило экрана: сравнивается с именем из `Respondo.setCurrentScreen`. `op`: exact | contains | not_contains | starts_with | ends_with. */
+data class RespondoScreenRule(val op: String, val value: String)
+
+/**
+ * «Когда и где» оверлей-опроса в приложении (backend survey_targeting.go). Пусто — опрос
+ * открывается на любом экране сразу, как раньше.
+ */
+data class RespondoSurveyTargeting(
+    /** Экраны, на которых опрос ждут; пусто — любой экран. */
+    val screenRules: List<RespondoScreenRule> = emptyList(),
+    /** Сколько секунд пробыть на подходящем экране (после события, если оно задано). */
+    val delaySeconds: Int = 0,
+    /** Событие `Respondo.track`, по которому опрос открывается (канон имени). */
+    val triggerEvent: String? = null,
+    /**
+     * Показывается ли опрос в приложениях («Show on»: сайт и приложения или только приложения).
+     * Опрос только для сайта каталог SDK не отдаёт.
+     */
+    val showsInApps: Boolean = true,
+)
+
 /** Оверлей-опрос (NPS/CSAT и др.), доставленный посетителю. */
 data class RespondoSurvey(
     val campaignId: String,
@@ -71,6 +92,11 @@ data class RespondoSurvey(
     val steps: List<List<String>>,
     val questions: List<RespondoQuestion>,
     val sender: RespondoSender?,
+    /**
+     * Экран, время и событие, которых опрос ждёт. Пустой [deliveryId] — опрос с таргетингом, ещё
+     * не открытый: доставку SDK получает в момент показа.
+     */
+    val targeting: RespondoSurveyTargeting = RespondoSurveyTargeting(),
 )
 
 /** Ответ пользователя на вопрос опроса (публичный тип, не раскрывает внутренний JSON). */

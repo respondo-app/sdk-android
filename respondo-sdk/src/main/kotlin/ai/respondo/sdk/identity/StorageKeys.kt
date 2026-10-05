@@ -11,6 +11,9 @@ internal object StorageKeys {
     const val LANG = "respondoai_lang"
     const val COLLECTED_EMAIL = "respondoai_collected_email"
 
+    /** Доставки опросов, которые посетитель закрыл (JSON-массив, новые в конце). */
+    const val SURVEY_DISMISSED = "respondoai_survey_dismissed"
+
     /** Блоб беседы: messages(50), conversationId, escalated, sessionToken, timestamp (TTL 24ч). */
     fun conversation(agentId: String?, channelId: String?): String =
         "respondoai_" + (agentId?.ifEmpty { null } ?: "ch") + "_" + (channelId?.ifEmpty { null } ?: "default")

@@ -1,5 +1,6 @@
 package ai.respondo.sdk.transport
 
+import ai.respondo.sdk.core.SurveyTargeting
 import ai.respondo.sdk.internal.RespondoLog
 import ai.respondo.sdk.internal.SdkInfo
 import ai.respondo.sdk.internal.respondoJson
@@ -312,7 +313,14 @@ class ApiClient(
         auth: AuthParams,
         email: String?,
         userId: String?,
+        surveyId: String? = null,
+        explicit: Boolean = false,
     ): SurveysCatalogResponseDto {
+        // SDK объявляет features=survey_targeting: он сам исполняет правила экранов, задержку и
+        // событие, поэтому сервер отдаёт ему и таргетированные опросы (без delivery_id до открытия).
+        // surveyId открывает один опрос — сервер минтит доставку; explicit — это startSurvey(id)
+        // (source=api: без правил и аудитории, но с расписанием и уже данным ответом). user_hash
+        // обязателен для каналов с identity verification: без подписи контакт понижается до анонима.
         val url = base + "/api/v1/widget/surveys" + UrlUtils.query(
             "agent_id" to agentId,
             "channel_id" to channelId,
@@ -320,6 +328,12 @@ class ApiClient(
             "visitor_id" to auth.visitorId,
             "email" to email,
             "user_id" to userId,
+            "user_hash" to auth.userHash,
+            "features" to SurveyTargeting.FEATURE,
+            // Опрос «только сайт» приложению не нужен — сервер его не отдаст.
+            "platform" to SurveyTargeting.CLIENT_PLATFORM,
+            "survey_id" to surveyId,
+            "source" to (if (explicit) "api" else null),
         )
         val resp = getWithRetry(url)
         ensureSuccess(resp)
