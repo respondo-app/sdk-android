@@ -13,6 +13,9 @@ import ai.respondo.sdk.transport.dto.NewsListResponseDto
 import ai.respondo.sdk.transport.dto.ResumeResponseDto
 import ai.respondo.sdk.transport.dto.SurveysCatalogResponseDto
 import ai.respondo.sdk.transport.dto.WidgetConfigDto
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -50,7 +53,51 @@ class FixtureParsingTest {
     fun chatResponseHandover_setsHumanHandover() {
         val dto = respondoJson.decodeFromString(ChatResponseDto.serializer(), Fixtures.read("chat-response-handover.json"))
         assertTrue(dto.humanHandover)
-        assertEquals(48213L, dto.ticketId)
+        assertNotNull(dto.message)
+    }
+
+    /**
+     * Прод-инцидент: после эскалации виджет показывал клиенту кнопку
+     * «View ticket #42466» со ссылкой на
+     * https://<tenant>.zendesk.com/agent/tickets/42466 — staff-интерфейс
+     * хелпдеска арендатора.
+     *
+     * Раньше фикстура handover содержала ticket_url/ticket_id, а этот сьют
+     * утверждал их наличие — тесты защищали утечку. Утверждение перевёрнуто:
+     * ни в одном клиентском payload не должно быть ключа со словом "ticket".
+     * Скан рекурсивный, вложенное поле тоже не проскочит. Аналог
+     * backend/internal/api/handlers/escalation_no_ticket_leak_test.go.
+     */
+    @Test
+    fun customerFacingFixtures_carryNoTicketKeys() {
+        val fixtures = listOf(
+            "chat-response-handover.json",
+            "chat-response-first.json",
+            "resume.json",
+            "history-page.json",
+        )
+        for (name in fixtures) {
+            val keys = mutableListOf<String>()
+            collectKeys(respondoJson.parseToJsonElement(Fixtures.read(name)), keys)
+            val leaked = keys.filter { it.lowercase().contains("ticket") }
+            assertTrue(
+                "фикстура $name содержит ключи $leaked: номер и URL тикета — внутренние " +
+                    "данные хелпдеска арендатора, клиенту они не уходят",
+                leaked.isEmpty(),
+            )
+        }
+    }
+
+    /** Рекурсивно собирает имена всех ключей JSON-объектов, включая вложенные в массивы. */
+    private fun collectKeys(element: JsonElement, out: MutableList<String>) {
+        when (element) {
+            is JsonObject -> element.forEach { (key, value) ->
+                out.add(key)
+                collectKeys(value, out)
+            }
+            is JsonArray -> element.forEach { collectKeys(it, out) }
+            else -> Unit
+        }
     }
 
     @Test

@@ -36,10 +36,18 @@ data class RespondoPushPayload(
     val deliveryId: String?
         get() = raw[KEY_DELIVERY_CACHE]
 
+    /**
+     * Диплинк экрана приложения, который открывается по тапу (`yourapp://orders/1` или `https://…`) — из поля
+     * кампании «Screen to open on tap». Для пушей ответа в беседе это `respondo://conversation/…`.
+     */
+    val deepLink: String?
+        get() = raw[KEY_DEEP_LINK_CACHE]
+
     companion object {
         private const val ROOT_KEY = "respondo"
         private const val KEY_TYPE_CACHE = "__respondo_type"
         private const val KEY_DELIVERY_CACHE = "__respondo_delivery_id"
+        private const val KEY_DEEP_LINK_CACHE = "__respondo_deep_link"
 
         /**
          * Разбирает словарь данных пуша. Возвращает `null`, если это не пуш Respondo (нет корневого ключа `respondo`).
@@ -61,6 +69,7 @@ data class RespondoPushPayload(
                 val enrichedRaw = HashMap(data)
                 if (type != null) enrichedRaw[KEY_TYPE_CACHE] = type
                 if (deliveryId != null) enrichedRaw[KEY_DELIVERY_CACHE] = deliveryId
+                root.stringOrNull("deep_link")?.takeIf { it.isNotBlank() }?.let { enrichedRaw[KEY_DEEP_LINK_CACHE] = it }
 
                 RespondoPushPayload(
                     conversationId = conversationId,

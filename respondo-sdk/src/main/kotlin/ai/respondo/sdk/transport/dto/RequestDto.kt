@@ -40,6 +40,7 @@ data class PushRegisterRequestDto(
     @SerialName("app_id") val appId: String? = null,
     val locale: String? = null,
     @SerialName("sdk_version") val sdkVersion: String? = null,
+    @SerialName("sdk_name") val sdkName: String? = null,
     @SerialName("visitor_id") val visitorId: String? = null,
     val email: String? = null,
     @SerialName("user_id") val userId: String? = null,

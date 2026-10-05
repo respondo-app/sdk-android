@@ -120,6 +120,7 @@ data class ChatResponseDto(
     @SerialName("human_handover") val humanHandover: Boolean = false,
     @SerialName("suggested_questions") val suggestedQuestions: List<String> = emptyList(),
     @SerialName("doc_links") val docLinks: List<DocLinkDto> = emptyList(),
-    @SerialName("ticket_url") val ticketUrl: String? = null,
-    @SerialName("ticket_id") val ticketId: Long? = null,
+    // Внимание: сюда НЕ добавляются ticket_url / ticket_id и любые другие ссылки
+    // на внутренние системы. Это customer-facing DTO; зеркалит
+    // backend/internal/api/handlers/chat_dto.go, где их тоже нет.
 )

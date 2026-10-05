@@ -32,7 +32,7 @@ The library is published to **Maven Central** as `ai.respondo:respondo-sdk`.
 ```kotlin
 // build.gradle.kts (app module)
 dependencies {
-    implementation("ai.respondo:respondo-sdk:0.1.0")
+    implementation("ai.respondo:respondo-sdk:0.2.0")
 }
 ```
 

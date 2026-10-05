@@ -17,10 +17,14 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class PushManagerTest {
 
-    private class FakeHost(private val foreground: Boolean = false) : PushHost {
+    private class FakeHost(
+        private val foreground: Boolean = false,
+        private val acceptsLinks: Boolean = true,
+    ) : PushHost {
         val seen = HashSet<String>()
         val opened = mutableListOf<String>()
         val unhandled = mutableListOf<RespondoPushPayload>()
+        val links = mutableListOf<String>()
 
         override fun hasSeenMessage(messageId: String): Boolean = seen.contains(messageId)
         override fun markMessageSeen(messageId: String) { seen.add(messageId) }
@@ -28,6 +32,10 @@ class PushManagerTest {
         override fun openConversation(conversationId: String): Boolean {
             opened += conversationId
             return true
+        }
+        override fun openDeepLink(link: String): Boolean {
+            links += link
+            return acceptsLinks
         }
         override fun onUnhandledDeepLink(payload: RespondoPushPayload) { unhandled += payload }
         override fun registrationContext(): PushRegistrationContext =
@@ -80,6 +88,28 @@ class PushManagerTest {
         val host = FakeHost()
         val pm = PushManager(api(FakeHttpEngine { HttpResponse(200, "{}") }), host, this)
         pm.handlePush(payload(msgId = "m-3", convId = null))
+        advanceUntilIdle()
+        assertEquals(1, host.unhandled.size)
+    }
+
+    @Test
+    fun handlePush_campaignDeepLink_opensLink() = runTest {
+        val host = FakeHost()
+        val pm = PushManager(api(FakeHttpEngine { HttpResponse(200, "{}") }), host, this)
+        val p = RespondoPushPayload.from(mapOf("respondo" to """{"type":"message","deep_link":"yourapp://orders/1"}"""))!!
+        pm.handlePush(p)
+        advanceUntilIdle()
+        assertEquals(listOf("yourapp://orders/1"), host.links)
+        assertTrue(host.unhandled.isEmpty())
+        assertTrue(host.opened.isEmpty())
+    }
+
+    @Test
+    fun handlePush_campaignDeepLink_notAccepted_reportsUnhandled() = runTest {
+        val host = FakeHost(acceptsLinks = false)
+        val pm = PushManager(api(FakeHttpEngine { HttpResponse(200, "{}") }), host, this)
+        val p = RespondoPushPayload.from(mapOf("respondo" to """{"type":"message","deep_link":"yourapp://orders/1"}"""))!!
+        pm.handlePush(p)
         advanceUntilIdle()
         assertEquals(1, host.unhandled.size)
     }

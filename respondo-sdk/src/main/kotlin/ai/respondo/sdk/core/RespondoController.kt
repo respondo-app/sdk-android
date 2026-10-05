@@ -151,6 +151,17 @@ internal class RespondoController(
     // --- рабочее состояние ---
     @Volatile private var conversationId: String? = null
     @Volatile private var sessionToken: String? = null
+
+    /**
+     * Беседа, на которую мы смотрим, ЗАКРЫТА (resolved/archived).
+     *
+     * Это флаг, а не забвение: id и токен остаются, потому что именно от этой строки бэкенд форкает
+     * follow-up — и на следующем сообщении, и на нажатии «нужен человек». Обоснование целиком —
+     * в [ControllerLogic] («граница сессии»). Отвечает флаг ровно за одно: на закрытой строке
+     * слушать нечего, поэтому реалтайм от неё отцепляется.
+     */
+    @Volatile internal var conversationClosed: Boolean = false
+        private set
     @Volatile private var historyConversationId: String? = null
     @Volatile private var oldestMessageId: String? = null
     @Volatile private var lastBackendMsgId: String? = null
@@ -273,12 +284,42 @@ internal class RespondoController(
         }
     }
 
+    /**
+     * Переехать в беседу, которую назвал сервер, и снова считать сессию живой.
+     *
+     * Решение целиком лежит в [ControllerLogic.adoptSession] — там же и обоснование, почему
+     * пустые поля ответа не имеют права затирать уже имеющиеся хэндлы.
+     */
+    private fun adoptSession(responseId: String?, responseToken: String?) {
+        val next = ControllerLogic.adoptSession(
+            ControllerLogic.SessionHandles(conversationId, sessionToken),
+            responseId,
+            responseToken,
+        )
+        sessionToken = next.sessionToken
+        val switched = next.conversationId != conversationId
+        if (switched) {
+            // Новая беседа — отменяем отложенный сброс после resolved, чтобы он не осиротил свежую.
+            resolvedResetJob?.cancel()
+            conversationId = next.conversationId
+            historyConversationId = next.conversationId
+        }
+        if (conversationClosed || switched) {
+            conversationClosed = false
+            next.conversationId?.let { realtimeChannel.setConversation(it) }
+        }
+    }
+
     private suspend fun applyResume(data: ai.respondo.sdk.transport.dto.ResumeResponseDto) {
         historyConversationId = data.historyConversationId ?: data.conversationId
         oldestMessageId = data.oldestMessageId
         _hasMoreHistory.value = data.hasMore
-        conversationId = data.conversationId // null при resolved (read-only)
+        // id приходит при ЛЮБОМ статусе, включая закрытый: сервер отдаёт его именно затем, чтобы
+        // следующему сообщению и нажатию «нужен человек» было от чего форкаться. Статус решает
+        // здесь только одно — есть ли ещё что слушать на этой строке.
+        conversationId = data.conversationId
         sessionToken = data.sessionToken
+        conversationClosed = ControllerLogic.isClosedStatus(data.status)
         setEscalated(data.status == "escalated")
         val restored = data.messages.map { ChatMessage.fromDto(it) }
         restored.forEach { seenMessageIds.add(it.id) }
@@ -288,7 +329,8 @@ internal class RespondoController(
             val merged = ControllerLogic.mergeResumeMessages(restored, _messages.value)
             _messages.value = if (merged.isEmpty()) messagesWithGreeting(emptyList()) else merged
         }
-        data.conversationId?.let { realtimeChannel.setConversation(it) }
+        // Закрытую строку не слушаем — на ней уже ничего не произойдёт.
+        if (!conversationClosed) data.conversationId?.let { realtimeChannel.setConversation(it) }
         persistCache()
     }
 
@@ -304,6 +346,9 @@ internal class RespondoController(
 
     fun identify(identity: RespondoIdentity) {
         identityStore.setIdentity(identity)
+        // Устройство — к контакту новой личности: токен, полученный до логина,
+        // иначе навсегда оставался на анонимном контакте визитёра.
+        pushManager.reRegister()
         realtimeChannel.reIdentify()
         conversationId?.let { realtimeChannel.setConversation(it) }
         // Каталоги overlay пересчитываются под известного контакта.
@@ -387,6 +432,7 @@ internal class RespondoController(
             // 3. Обнулить рантайм-состояние.
             conversationId = null
             sessionToken = null
+            conversationClosed = false
             historyConversationId = null
             oldestMessageId = null
             lastBackendMsgId = null
@@ -543,6 +589,7 @@ internal class RespondoController(
                 // (в т. ч. retry) форкнет новую беседу вместо повторных 410.
                 conversationId = null
                 sessionToken = null
+                conversationClosed = false
                 realtimeChannel.setConversation(null)
             }
             RespondoLog.w("отправка не удалась (HTTP ${e.code})", e)
@@ -557,15 +604,9 @@ internal class RespondoController(
     }
 
     private suspend fun applyChatResponse(response: ChatResponseDto) {
-        response.sessionToken?.let { sessionToken = it }
-        response.conversationId?.let { newId ->
-            if (newId != conversationId) {
-                // Новая беседа — отменяем отложенный сброс после resolved, чтобы он не осиротил свежую беседу.
-                resolvedResetJob?.cancel()
-                conversationId = newId
-                realtimeChannel.setConversation(newId)
-            }
-        }
+        // Другой id означает, что закрытая строка форкнулась: с этого момента беседа пользователя —
+        // новая, и остаться на старой значило бы форкать её снова каждым сообщением.
+        adoptSession(response.conversationId, response.sessionToken)
 
         val msg = response.message
         when {
@@ -600,16 +641,26 @@ internal class RespondoController(
 
     // ==================== эскалация ====================
 
+    /**
+     * «Нужен человек». Работает и на ЗАКРЫТОЙ беседе — в этом весь смысл того, что хэндлы
+     * переживают закрытие: [cid] и есть строка, ОТ которой бэкенд форкает follow-up.
+     */
     fun escalate() {
         val cid = conversationId ?: return
         scope.launch {
             try {
                 val result = apiClient.escalate(cid, identityStore.authParams(sessionToken))
+                // ХЭНДЛЫ НОВОЙ СТРОКИ ПОДХВАТЫВАЮТСЯ. Из ответа читался только `message`, и клиент
+                // оставался на закрытой беседе: оператор получал кейс без единого сообщения, его
+                // ответ до пользователя не доходил, а следующее сообщение форкало третью строку,
+                // выбивая вторую из цепочки.
+                adoptSession(result.conversationId, result.sessionToken)
                 setEscalated(true)
                 _suggestedQuestions.value = emptyList()
                 val text = result.message ?: Strings.get(currentLang(), "escalatedMessage")
+                // Карточка передачи оператору — без ссылок. Тикет-трекер это
+                // наша внутренняя кухня, клиенту она не показывается.
                 addSystemMessage(text, "escalate-card")
-                result.ticketUrl?.takeIf { UrlSafety.isHttp(it) }?.let { _docLinks.value = _docLinks.value + ("escalate-card" to listOf(DocLinkDto("Ticket", it))) }
             } catch (e: IOException) {
                 addSystemMessage(Strings.get(currentLang(), "networkError"), "escalate-error")
             } finally {
@@ -744,12 +795,19 @@ internal class RespondoController(
         }
     }
 
+    /**
+     * Беседу закрыли. Реалтайм отпускаем, ХЭНДЛЫ ОСТАВЛЯЕМ — см. [conversationClosed].
+     *
+     * Здесь стояло `conversationId = null; sessionToken = null`, и это ломало обе развилки сразу:
+     * следующее сообщение уходило без id закрытой строки и рождало осиротевший корень, а
+     * `escalate()` выходил на первой же строке (`conversationId ?: return`) — то есть кнопка
+     * «нужен человек» через три секунды после закрытия молча переставала работать.
+     */
     private fun scheduleResolvedReset() {
         resolvedResetJob?.cancel()
         resolvedResetJob = scope.launch {
             delay(RESOLVED_RESET_MS)
-            conversationId = null
-            sessionToken = null
+            conversationClosed = true
             setEscalated(false)
             _suggestedQuestions.value = emptyList()
             realtimeChannel.setConversation(null)
@@ -972,6 +1030,8 @@ internal class RespondoController(
             scope.launch { resumeOnce() }
             return true
         }
+
+        override fun openDeepLink(link: String): Boolean = DeepLinkOpener.open(app, link)
 
         override fun onUnhandledDeepLink(payload: RespondoPushPayload) {
             notifyMain { it.onUnhandledDeepLink(payload) }

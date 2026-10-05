@@ -34,6 +34,12 @@ interface PushHost {
     /** Открывает беседу; возвращает true, если она отображена (иначе — [RespondoListener.onUnhandledDeepLink]). */
     fun openConversation(conversationId: String): Boolean
 
+    /**
+     * Открывает диплинк экрана приложения из push-кампании (как Intercom: ссылку отдаём системе, приложение
+     * принимает её своим intent-filter). true — ссылку кто-то принял.
+     */
+    fun openDeepLink(link: String): Boolean
+
     fun onUnhandledDeepLink(payload: RespondoPushPayload)
 
     fun registrationContext(): PushRegistrationContext
@@ -69,7 +75,7 @@ class PushManager(
         }
     }
 
-    /** Перерегистрирует текущий токен под актуальным визитёром (вызывается после reset). */
+    /** Перерегистрирует текущий токен под актуальной личностью/визитёром (после identify и reset). */
     fun reRegister() {
         if (deviceToken != null) register()
     }
@@ -92,6 +98,7 @@ class PushManager(
                     appId = ctx.appId,
                     locale = ctx.locale,
                     sdkVersion = SdkInfo.VERSION,
+                    sdkName = SdkInfo.SOURCE,
                     visitorId = ctx.visitorId,
                     email = ctx.email,
                     userId = ctx.userId,
@@ -109,7 +116,9 @@ class PushManager(
     /**
      * Обрабатывает тап по пушу. Дедуп по message_id: повтор не открывает и не дублирует. Foreground-подавление:
      * если беседа уже открыта — эффектов нет (сообщение уже на экране). Иначе открывает беседу; если беседа
-     * недоступна — [PushHost.onUnhandledDeepLink]. Телеметрия открытия — best-effort.
+     * недоступна — [PushHost.onUnhandledDeepLink]. Пуш без беседы (кампания) открывает свой диплинк через
+     * [PushHost.openDeepLink]; нет ссылки или её никто не принял — [PushHost.onUnhandledDeepLink].
+     * Телеметрия открытия — best-effort.
      */
     fun handlePush(payload: RespondoPushPayload) {
         val messageId = payload.messageId
@@ -122,7 +131,8 @@ class PushManager(
 
         val conversationId = payload.conversationId
         if (conversationId.isNullOrEmpty()) {
-            host.onUnhandledDeepLink(payload)
+            val link = payload.deepLink
+            if (link.isNullOrBlank() || !host.openDeepLink(link)) host.onUnhandledDeepLink(payload)
             reportOpened(payload)
             return
         }

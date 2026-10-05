@@ -114,8 +114,17 @@ afterEvaluate {
                         url.set("https://respondo.ai")
                     }
                     scm {
-                        url.set("https://bitbucket.org/hub2026/respondo")
-                        connection.set("scm:git:https://bitbucket.org/hub2026/respondo.git")
+                        url.set("https://github.com/respondo-app/sdk-android")
+                        connection.set("scm:git:https://github.com/respondo-app/sdk-android.git")
+                        developerConnection.set("scm:git:https://github.com/respondo-app/sdk-android.git")
+                    }
+                    developers {
+                        developer {
+                            id.set("respondo")
+                            name.set("Respondo")
+                            organization.set("Respondo")
+                            organizationUrl.set("https://respondo.ai")
+                        }
                     }
                     licenses {
                         license {

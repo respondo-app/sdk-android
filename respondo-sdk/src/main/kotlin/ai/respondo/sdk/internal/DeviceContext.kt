@@ -2,7 +2,7 @@ package ai.respondo.sdk.internal
 
 import android.content.Context
 import android.os.Build
-import java.time.ZoneId
+import java.util.TimeZone
 
 /**
  * Технический контекст устройства — мобильный аналог `page_url` веба. Домешивается в `identity.metadata`
@@ -45,7 +45,7 @@ internal class DeviceContext(
                 pkg.versionName ?: "unknown"
             }.getOrDefault("unknown")
 
-            val timezone = runCatching { ZoneId.systemDefault().id }.getOrDefault("UTC")
+            val timezone = runCatching { TimeZone.getDefault().id }.getOrDefault("UTC")
 
             return DeviceContext(
                 appVersion = appVersion,
