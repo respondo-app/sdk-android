@@ -9,6 +9,7 @@ import ai.respondo.sdk.transport.dto.ChatRequestDto
 import ai.respondo.sdk.transport.dto.ChatResponseDto
 import ai.respondo.sdk.transport.dto.ChecklistProgressRequestDto
 import ai.respondo.sdk.transport.dto.ChecklistsCatalogResponseDto
+import ai.respondo.sdk.transport.dto.AppSessionRequestDto
 import ai.respondo.sdk.transport.dto.BannerResponseRequestDto
 import ai.respondo.sdk.transport.dto.BannersCatalogResponseDto
 import ai.respondo.sdk.transport.dto.ContinueResponseDto
@@ -20,6 +21,8 @@ import ai.respondo.sdk.transport.dto.SubmitAnswerRequestDto
 import ai.respondo.sdk.transport.dto.SubmitSurveyRequestDto
 import ai.respondo.sdk.transport.dto.SurveysCatalogResponseDto
 import ai.respondo.sdk.transport.dto.ProactiveResponseDto
+import ai.respondo.sdk.transport.dto.RatingRequestDto
+import ai.respondo.sdk.transport.dto.RatingResponseDto
 import ai.respondo.sdk.transport.dto.PushOpenedRequestDto
 import ai.respondo.sdk.transport.dto.PushRegisterRequestDto
 import ai.respondo.sdk.transport.dto.PushUnregisterRequestDto
@@ -27,9 +30,15 @@ import ai.respondo.sdk.transport.dto.ResumeResponseDto
 import ai.respondo.sdk.transport.dto.RevokeResponseDto
 import ai.respondo.sdk.transport.dto.TrackEventRequestDto
 import ai.respondo.sdk.transport.dto.WidgetConfigDto
+import ai.respondo.sdk.transport.dto.WidgetIdentifyRequestDto
 import ai.respondo.sdk.transport.dto.WidgetMessagesResponseDto
 import kotlinx.coroutines.delay
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.io.IOException
 
 /** Параметры доказательства владения беседой (query-часть виджет-эндпоинтов). */
@@ -41,7 +50,27 @@ data class AuthParams(
 
 /** Исключение при не-2xx ответе, который не обрабатывается специальным кодом. */
 class ApiException(val code: Int, val bodyText: String) :
-    IOException("HTTP $code: ${bodyText.take(200)}")
+    IOException("HTTP $code: ${bodyText.take(200)}") {
+
+    private val errorFields: Pair<String?, String?> by lazy { parseErrorFields(bodyText) }
+
+    /** Код ошибки бэкенда (`BAD_REQUEST`, `NOT_FOUND`); null, если тело не в формате с кодом. [code] остаётся HTTP-статусом. */
+    val errorCode: String? get() = errorFields.first
+
+    /** Текст ошибки бэкенда; null, если тело не в формате с сообщением. */
+    val errorMessage: String? get() = errorFields.second
+
+    private companion object {
+        /** Плоская форма: `code`/`message` в корне; вложенная: `error` — объект с теми же полями. */
+        fun parseErrorFields(body: String): Pair<String?, String?> = runCatching {
+            val root = respondoJson.parseToJsonElement(body).jsonObject
+            val nested = root["error"] as? JsonObject
+            fun field(name: String): String? =
+                ((nested?.get(name) ?: root[name]) as? JsonPrimitive)?.takeIf { it.isString }?.content
+            field("code") to field("message")
+        }.getOrDefault(null to null)
+    }
+}
 
 /** Итог `resume`: восстановление, пусто (204), запрет (403) или сбой сети. */
 sealed interface ResumeOutcome {
@@ -134,14 +163,36 @@ class ApiClient(
         return decode(ChatResponseDto.serializer(), resp)
     }
 
-    /** `POST /chat/upload` (multipart). Клиентская проверка лимита 20МБ до отправки. */
-    suspend fun uploadFile(bytes: ByteArray, filename: String, contentType: String): ChatAttachmentDto {
+    /**
+     * `POST /chat/upload` (multipart). Клиентская проверка лимита 20МБ до отправки.
+     *
+     * Форма: `file` и `agent_id` уходят всегда. `conversation_id` и ключи владения (`session_token`,
+     * `user_hash`, `visitor_id`, только непустые) — лишь когда [conversationId] непуст и непуст
+     * `session_token` или `user_hash`; иначе ни беседы, ни ключей в форме нет. Так форму принимает
+     * гейт `uploadAuthorized` на бэкенде.
+     */
+    suspend fun uploadFile(
+        bytes: ByteArray,
+        filename: String,
+        contentType: String,
+        agentId: String,
+        conversationId: String? = null,
+        auth: AuthParams = AuthParams(),
+    ): ChatAttachmentDto {
         require(bytes.size <= MAX_UPLOAD_BYTES) { "attachment exceeds 20MB limit" }
+        val fields = linkedMapOf("agent_id" to agentId)
+        val hasOwnershipKey = !auth.sessionToken.isNullOrEmpty() || !auth.userHash.isNullOrEmpty()
+        if (!conversationId.isNullOrEmpty() && hasOwnershipKey) {
+            fields["conversation_id"] = conversationId
+            auth.sessionToken?.takeIf { it.isNotEmpty() }?.let { fields["session_token"] = it }
+            auth.userHash?.takeIf { it.isNotEmpty() }?.let { fields["user_hash"] = it }
+            auth.visitorId?.takeIf { it.isNotEmpty() }?.let { fields["visitor_id"] = it }
+        }
         val resp = engine.execute(
             HttpRequest(
                 method = HttpMethod.POST,
                 url = "$base/api/v1/chat/upload",
-                body = HttpBody.Multipart("file", filename, contentType, bytes),
+                body = HttpBody.Multipart("file", filename, contentType, bytes, fields),
             ),
         )
         ensureSuccess(resp)
@@ -228,6 +279,27 @@ class ApiClient(
         val resp = postWithAuth("/api/v1/chat/conversations/$conversationId/escalate", auth)
         ensureSuccess(resp)
         return decode(EscalationResponseDto.serializer(), resp)
+    }
+
+    /**
+     * `POST /chat/conversations/{id}/rating` — оценка 1–5 и необязательный отзыв (behavior.md §12).
+     * Не-2xx → [ApiException] (тело `{"error": "rating not requested" | "remark locked"}`).
+     */
+    suspend fun rateConversation(conversationId: String, request: RatingRequestDto, auth: AuthParams): RatingResponseDto {
+        val url = base + "/api/v1/chat/conversations/" + conversationId + "/rating" + UrlUtils.query(
+            "session_token" to auth.sessionToken,
+            "user_hash" to auth.userHash,
+            "visitor_id" to auth.visitorId,
+        )
+        val resp = engine.execute(
+            HttpRequest(
+                method = HttpMethod.POST,
+                url = url,
+                body = HttpBody.Json(respondoJson.encodeToString(RatingRequestDto.serializer(), request)),
+            ),
+        )
+        ensureSuccess(resp)
+        return decode(RatingResponseDto.serializer(), resp)
     }
 
     /** `POST /chat/conversations/{id}/continue`. */
@@ -390,6 +462,44 @@ class ApiClient(
         }
     }
 
+    /**
+     * `POST /widget/identify` — свойства контакта из `identify()` сразу в профиль (как `syncIdentity`
+     * веб-виджета). Best-effort: false — сеть или не-2xx (вызывающий сбрасывает дедуп и повторит на
+     * следующем `identify()`).
+     */
+    suspend fun identify(request: WidgetIdentifyRequestDto): Boolean = identifyOutcome(request).sent
+
+    /**
+     * `POST /widget/identify` с ответом: [IdentifyOutcome.sent] — сервер принял (2xx);
+     * [IdentifyOutcome.created] — контакт личности создан этим вызовом (`created:true`), сокету пора
+     * переотправить identify. Ответ без тела или другого вида — не сбой, просто не «создан».
+     */
+    suspend fun identifyOutcome(request: WidgetIdentifyRequestDto): IdentifyOutcome {
+        val path = "/api/v1/widget/identify"
+        return try {
+            val resp = engine.execute(
+                HttpRequest(
+                    method = HttpMethod.POST,
+                    url = "$base$path",
+                    body = HttpBody.Json(respondoJson.encodeToString(WidgetIdentifyRequestDto.serializer(), request)),
+                ),
+            )
+            if (!resp.isSuccessful) {
+                IdentifyOutcome(sent = false, created = false)
+            } else {
+                IdentifyOutcome(sent = true, created = identifyCreated(resp.body))
+            }
+        } catch (e: IOException) {
+            RespondoLog.w("POST $path: сетевой сбой", e)
+            IdentifyOutcome(sent = false, created = false)
+        }
+    }
+
+    /** `POST /widget/app-session` — сессия приложения (запуск / возврат из фона). Best-effort. */
+    suspend fun appSession(request: AppSessionRequestDto): Boolean = postJsonBestEffort(
+        "/api/v1/widget/app-session", AppSessionRequestDto.serializer(), request,
+    )
+
     // --- push (planned endpoints) ---
 
     /** `POST /widget/push/register`. */
@@ -468,3 +578,11 @@ class ApiClient(
         const val SOURCE: String = SdkInfo.SOURCE
     }
 }
+
+/** Итог `POST /widget/identify` ([ApiClient.identifyOutcome]). */
+data class IdentifyOutcome(val sent: Boolean, val created: Boolean)
+
+/** `created:true` в ответе `/widget/identify`; тело не JSON или без флага — false. */
+internal fun identifyCreated(body: String): Boolean = runCatching {
+    respondoJson.parseToJsonElement(body).jsonObject["created"]?.jsonPrimitive?.booleanOrNull == true
+}.getOrDefault(false)

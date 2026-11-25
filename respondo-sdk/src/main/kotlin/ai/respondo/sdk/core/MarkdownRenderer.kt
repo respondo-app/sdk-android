@@ -9,13 +9,21 @@ internal data class RichSpan(
     val link: String? = null,
 )
 
-/** Блок рич-разметки: абзац или элемент списка. */
+/** Блок рич-разметки: абзац, элемент списка или отступ абзаца. */
 internal sealed interface RichBlock {
     val spans: List<RichSpan>
 
     data class Paragraph(override val spans: List<RichSpan>) : RichBlock
     data class Bullet(override val spans: List<RichSpan>) : RichBlock
     data class Ordered(val number: Int, override val spans: List<RichSpan>) : RichBlock
+
+    /**
+     * Пустая строка между абзацами markdown. Без неё абзац, отделённый пустой строкой, рисовался
+     * вплотную, как простой перенос (тело макроса, 2026-10-30).
+     */
+    object Gap : RichBlock {
+        override val spans: List<RichSpan> = emptyList()
+    }
 }
 
 /** Результат разбора контента сообщения в блоки/спаны для нативного рендера. */
@@ -45,19 +53,86 @@ internal object MarkdownRenderer {
 
     private fun renderMarkdown(text: String): RichText {
         val blocks = ArrayList<RichBlock>()
+        // Пустая строка после блока — отступ абзаца перед СЛЕДУЮЩИМ блоком: один на серию пустых
+        // строк, и ни одного в начале или в конце сообщения.
+        var pendingGap = false
+        // Номер пункта: первый пункт серии — номер источника, следующие — +1 (паритет с iOS и
+        // Flutter). Пустая строка серию НЕ рвёт — рыхлый список импорта «1. a\n\n2. b» держит
+        // номера; рвёт любой другой блок.
+        var lastOrdinal: Int? = null
         for (rawLine in text.split('\n')) {
             val line = rawLine.trimEnd()
-            if (line.isBlank()) continue
+            if (line.isBlank()) {
+                if (blocks.isNotEmpty()) pendingGap = true
+                continue
+            }
+            if (pendingGap) {
+                blocks.add(RichBlock.Gap)
+                pendingGap = false
+            }
+            // «\#» в начале строки — литерал «#», не заголовок: канонический вид тела хранит этот
+            // экран, чтобы «\# of orders» не стал заголовком (паритет с iOS и Flutter).
+            val escapedHeading = escapedHeadingText(line)
+            if (escapedHeading != null) {
+                lastOrdinal = null
+                blocks.add(RichBlock.Paragraph(parseInline(escapedHeading)))
+                continue
+            }
             val trimmed = line.trimStart()
+            val heading = headingContent(line)
+            val quote = quoteContent(line)
             val bullet = bulletContent(trimmed)
             val ordered = orderedContent(trimmed)
+            if (heading != null || quote != null || bullet != null || ordered == null) lastOrdinal = null
             when {
+                // Заголовок — жирной строкой, без решёток (как Telegram, WhatsApp и почта).
+                heading != null -> blocks.add(RichBlock.Paragraph(styled(parseInline(heading.replace("**", "")), bold = true)))
+                // Цитата — строкой без маркера «> ».
+                quote != null -> blocks.add(RichBlock.Paragraph(parseInline(quote)))
                 bullet != null -> blocks.add(RichBlock.Bullet(parseInline(bullet)))
-                ordered != null -> blocks.add(RichBlock.Ordered(ordered.first, parseInline(ordered.second)))
+                ordered != null -> {
+                    val number = lastOrdinal?.plus(1) ?: ordered.first
+                    lastOrdinal = number
+                    blocks.add(RichBlock.Ordered(number, parseInline(ordered.second)))
+                }
                 else -> blocks.add(RichBlock.Paragraph(parseInline(line)))
             }
         }
         return RichText(blocks)
+    }
+
+    /** Строка `\#…` (до трёх ведущих пробелов) — её текст без бэкслэша, иначе null. */
+    private fun escapedHeadingText(line: String): String? {
+        var i = 0
+        while (i < line.length && i < 3 && line[i] == ' ') i++
+        if (i + 1 >= line.length || line[i] != '\\' || line[i + 1] != '#') return null
+        return line.substring(i + 1)
+    }
+
+    /** Текст ATX-заголовка (`#`…`######` + пробел, до трёх ведущих пробелов) без решёток, иначе null. */
+    private fun headingContent(line: String): String? {
+        var i = 0
+        while (i < line.length && i < 3 && line[i] == ' ') i++
+        var hashes = 0
+        while (i < line.length && line[i] == '#' && hashes < 7) {
+            i++; hashes++
+        }
+        if (hashes == 0 || hashes > 6 || i >= line.length || (line[i] != ' ' && line[i] != '\t')) return null
+        // Закрывающие решётки («## Steps ##») — только после пробела: «## C#» остаётся «C#».
+        val text = line.substring(i).trim().replace(HEADING_CLOSING, "").trim()
+        return text.ifEmpty { null }
+    }
+
+    private val HEADING_CLOSING = Regex("[ \\t]+#+$")
+
+    /** Текст строки цитаты (`>` + необязательный пробел, до трёх ведущих пробелов), иначе null. */
+    private fun quoteContent(line: String): String? {
+        var i = 0
+        while (i < line.length && i < 3 && line[i] == ' ') i++
+        if (i >= line.length || line[i] != '>') return null
+        i++
+        if (i < line.length && (line[i] == ' ' || line[i] == '\t')) i++
+        return line.substring(i)
     }
 
     /** Возвращает текст элемента маркированного списка (`- `, `* `, `+ `) или null. */
@@ -78,7 +153,7 @@ internal object MarkdownRenderer {
         return number to line.substring(i + 2).trim()
     }
 
-    /** Инлайн-разбор строки: `code`, **bold**, *italic*, [text](url), автоссылки http(s). */
+    /** Инлайн-разбор строки: `code`, **bold**, *italic*, [text](url), ![alt](url) — ссылкой, автоссылки http(s). */
     private fun parseInline(s: String): List<RichSpan> {
         val spans = ArrayList<RichSpan>()
         val buf = StringBuilder()
@@ -127,6 +202,20 @@ internal object MarkdownRenderer {
                     }
                 }
 
+                // Картинка ![alt](url) — ссылкой с подписью alt (пустой alt — адресом), без «!»:
+                // картинки в пузыре SDK не рисует, а «!» перед ссылкой клиент читал буквально
+                // (тела макросов несут картинки).
+                c == '!' && i + 1 < n && s[i + 1] == '[' -> {
+                    val link = tryParseLink(s, i + 1)
+                    if (link != null) {
+                        flush()
+                        spans.addAll(link.spans)
+                        i = link.next
+                    } else {
+                        buf.append(c); i++
+                    }
+                }
+
                 c == '[' -> {
                     val link = tryParseLink(s, i)
                     if (link != null) {
@@ -138,12 +227,16 @@ internal object MarkdownRenderer {
                     }
                 }
 
-                (c == 'h' || c == 'H') && startsWithUrl(s, i) -> {
+                (c == 'h' || c == 'H') && startsWithUrl(s, i) && isUrlBoundary(s, i) -> {
                     val end = urlEnd(s, i)
-                    flush()
                     val url = s.substring(i, end)
-                    spans.add(RichSpan(url, link = url))
-                    i = end
+                    if (UrlSafety.isHttp(url)) {
+                        flush()
+                        spans.add(RichSpan(url, link = url))
+                        i = end
+                    } else {
+                        buf.append(c); i++
+                    }
                 }
 
                 else -> {
@@ -163,8 +256,16 @@ internal object MarkdownRenderer {
     private fun tryParseLink(s: String, start: Int): ParsedLink? {
         val closeBracket = s.indexOf(']', start + 1)
         if (closeBracket <= start || closeBracket + 1 >= s.length || s[closeBracket + 1] != '(') return null
-        val closeParen = s.indexOf(')', closeBracket + 2)
-        if (closeParen <= closeBracket + 1) return null
+        var closeParen = closeBracket + 2
+        var depth = 0
+        while (closeParen < s.length) {
+            when (s[closeParen]) {
+                '(' -> depth++
+                ')' -> if (depth == 0) break else depth--
+            }
+            closeParen++
+        }
+        if (closeParen <= closeBracket + 1 || closeParen >= s.length) return null
         val label = s.substring(start + 1, closeBracket)
         val url = s.substring(closeBracket + 2, closeParen).trim()
         val labelSpans = parseInline(label).ifEmpty { listOf(RichSpan(url)) }
@@ -176,11 +277,34 @@ internal object MarkdownRenderer {
     private fun startsWithUrl(s: String, i: Int): Boolean =
         s.startsWith("http://", i, ignoreCase = true) || s.startsWith("https://", i, ignoreCase = true)
 
+    private fun isUrlBoundary(s: String, i: Int): Boolean {
+        if (i == 0) return true
+        val previous = s[i - 1]
+        return !previous.isLetterOrDigit() && previous !in "_/@.+-:$%\\\"'"
+    }
+
     private fun urlEnd(s: String, start: Int): Int {
         var j = start
-        while (j < s.length && !s[j].isWhitespace() && s[j] !in "()<>\"") j++
+        val open = ArrayDeque<Char>()
+        while (j < s.length) {
+            val c = s[j]
+            if (c.isWhitespace() || c in "<>\"'`*") break
+            when (c) {
+                '(', '[', '{' -> open.addLast(c)
+                ')', ']', '}' -> {
+                    val expected = when (c) {
+                        ')' -> '('
+                        ']' -> '['
+                        else -> '{'
+                    }
+                    if (open.lastOrNull() != expected) break
+                    open.removeLast()
+                }
+            }
+            j++
+        }
         // Хвостовую пунктуацию не втягиваем в ссылку.
-        while (j > start && s[j - 1] in ".,;:!?") j--
+        while (j > start && s[j - 1] in ".,;:!?…") j--
         return j
     }
 
@@ -197,7 +321,16 @@ internal object MarkdownRenderer {
 
         fun flushText() {
             if (text.isNotEmpty()) {
-                spans.add(RichSpan(text.toString(), bold = bold, italic = italic, code = code, link = link))
+                val raw = text.toString()
+                if (link == null && !code) {
+                    spans.addAll(
+                        parseBareUrls(raw).map { span ->
+                            span.copy(bold = bold, italic = italic)
+                        },
+                    )
+                } else {
+                    spans.add(RichSpan(raw, bold = bold, italic = italic, code = code, link = link))
+                }
                 text.clear()
             }
         }
@@ -282,6 +415,31 @@ internal object MarkdownRenderer {
             while (k < tag.length && !tag[k].isWhitespace() && tag[k] != '>') k++
             tag.substring(j, k).trim()
         }
+    }
+
+    /** Автоссылки в plain-тексте HTML-ветки (backend оставляет content_format=html
+     * после downgrade, а сам content отдаёт без тегов). Markdown-разметку здесь
+     * намеренно не разбираем — HTML-стили уже применены выше. */
+    private fun parseBareUrls(text: String): List<RichSpan> {
+        val spans = ArrayList<RichSpan>()
+        var i = 0
+        var plainStart = 0
+        while (i < text.length) {
+            if ((text[i] == 'h' || text[i] == 'H') && startsWithUrl(text, i) && isUrlBoundary(text, i)) {
+                val end = urlEnd(text, i)
+                val url = text.substring(i, end)
+                if (UrlSafety.isHttp(url)) {
+                    if (plainStart < i) spans.add(RichSpan(text.substring(plainStart, i)))
+                    spans.add(RichSpan(url, link = url))
+                    i = end
+                    plainStart = end
+                    continue
+                }
+            }
+            i++
+        }
+        if (plainStart < text.length) spans.add(RichSpan(text.substring(plainStart)))
+        return if (spans.isEmpty()) listOf(RichSpan(text)) else spans
     }
 
     private fun decodeEntity(raw: String): String = when (raw.lowercase()) {

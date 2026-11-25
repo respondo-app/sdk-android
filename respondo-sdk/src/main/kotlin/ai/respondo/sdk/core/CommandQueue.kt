@@ -29,10 +29,8 @@ class CommandQueue {
 
     @Synchronized
     fun enqueue(command: QueuedCommand) {
-        if (command is QueuedCommand.Identify) {
-            // Схлопывание: снять предыдущий identify, оставить последний.
-            items.removeAll { it is QueuedCommand.Identify }
-        }
+        // Схлопывание: снять предыдущий identify, оставить последний.
+        if (command is QueuedCommand.Identify) dropIdentify()
         if (items.size >= MAX_SIZE) {
             val oldestReplaceable = items.indexOfFirst { it !is QueuedCommand.HandlePush }
             if (oldestReplaceable >= 0) {
@@ -43,6 +41,12 @@ class CommandQueue {
             RespondoLog.w("command-queue переполнена — отброшен самый старый вызов")
         }
         items.addLast(command)
+    }
+
+    /** Снимает отложенные `identify`: личность `init(identity)` новее их. */
+    @Synchronized
+    fun dropIdentify() {
+        items.removeAll { it is QueuedCommand.Identify }
     }
 
     /** Извлекает все команды в порядке поступления и очищает очередь. */

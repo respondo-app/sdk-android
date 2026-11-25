@@ -62,3 +62,47 @@ data class PushOpenedRequestDto(
     @SerialName("message_id") val messageId: String? = null,
     val token: String,
 )
+
+/**
+ * Тело `POST /widget/identify`: личность и свойства контакта из `identify()` доходят до профиля сразу,
+ * без чата (как `syncIdentity` веб-виджета). Шлётся, если у личности есть `user_id`/`email` (контакт
+ * создаётся и без свойств — вход пользователя, как в Intercom Messenger) или непустые [properties];
+ * доверие — то же identity-гейт, что у `/chat` (`user_hash`). Свойство `language_override` — явный язык
+ * контакта; [signedUpAt] — дата регистрации в продукте.
+ */
+@Serializable
+data class WidgetIdentifyRequestDto(
+    @SerialName("agent_id") val agentId: String? = null,
+    @SerialName("channel_id") val channelId: String,
+    @SerialName("visitor_id") val visitorId: String? = null,
+    val email: String? = null,
+    @SerialName("user_id") val userId: String? = null,
+    @SerialName("user_hash") val userHash: String? = null,
+    val name: String? = null,
+    val properties: Map<String, String>,
+    /** Дата регистрации в продукте ([ai.respondo.sdk.RespondoIdentity.signedUpAt]), Unix-секунды. */
+    @SerialName("signed_up_at") val signedUpAt: Long? = null,
+)
+
+/**
+ * Тело `POST /widget/app-session`: сессия приложения (запуск, возврат из фона) — источник «Last seen on
+ * Android», числа сессий и языка устройства у контакта. Работает без разрешения на пуши.
+ * [platform] без значения по умолчанию: `encodeDefaults = false` выбросил бы дефолт из тела.
+ */
+@Serializable
+data class AppSessionRequestDto(
+    @SerialName("agent_id") val agentId: String? = null,
+    @SerialName("channel_id") val channelId: String,
+    @SerialName("visitor_id") val visitorId: String? = null,
+    val email: String? = null,
+    @SerialName("user_id") val userId: String? = null,
+    @SerialName("user_hash") val userHash: String? = null,
+    /** Имя личности: сервер берёт его, только если отметка создаёт контакт (слово приложения, «claimed»). */
+    val name: String? = null,
+    val platform: String,
+    @SerialName("app_id") val appId: String? = null,
+    @SerialName("app_version") val appVersion: String? = null,
+    @SerialName("sdk_name") val sdkName: String? = null,
+    @SerialName("sdk_version") val sdkVersion: String? = null,
+    val locale: String? = null,
+)

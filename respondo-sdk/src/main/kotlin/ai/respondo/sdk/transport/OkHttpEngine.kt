@@ -55,6 +55,7 @@ internal class OkHttpEngine(
         is HttpBody.Json -> text.toRequestBody(JSON_MEDIA)
         is HttpBody.Multipart -> MultipartBody.Builder()
             .setType(MultipartBody.FORM)
+            .also { builder -> fields.forEach { (name, value) -> builder.addFormDataPart(name, value) } }
             .addFormDataPart(
                 name = fieldName,
                 filename = filename,

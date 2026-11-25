@@ -9,7 +9,8 @@ import java.util.TimeZone
  * перед каждой отправкой; host-значения с тем же ключом имеют приоритет (см. api-surface §8).
  */
 internal class DeviceContext(
-    private val appVersion: String,
+    /** Версия host-приложения (`versionName`); `unknown`, если её не прочитать. */
+    val appVersion: String,
     private val osVersion: String,
     private val deviceModel: String,
     private val timezone: String,

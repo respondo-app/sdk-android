@@ -64,6 +64,10 @@ data class MessageMetadataDto(
     val announcement: JsonObject? = null,
     @SerialName("survey_step") val surveyStep: JsonObject? = null,
     @SerialName("survey_inline") val surveyInline: JsonObject? = null,
+    /** Стандартное уведомление о передаче (текст сервера): оно само — карточка, вторую не рисуют. */
+    @SerialName("handover_canned") val handoverCanned: Boolean? = null,
+    /** Карточка «передано человеку» под ответом модели или своим текстом агента — на языке клиента. */
+    @SerialName("handover_card_text") val handoverCardText: String? = null,
 )
 
 /** Сообщение беседы в форме, как её сериализует бэкенд для виджета (customer-safe). */
@@ -109,7 +113,21 @@ data class ChatRequestDto(
     val attachments: List<ChatAttachmentDto>? = null,
     val identity: ChatIdentityDto? = null,
     @SerialName("session_token") val sessionToken: String? = null,
+    /** Откуда текст сообщения ([InputSource]): набрал посетитель или SDK за него. */
+    @SerialName("input_source") val inputSource: String? = null,
 )
+
+/**
+ * Значения `input_source` тела `POST /chat` — как у веб-виджета. Текст, который набрал не посетитель,
+ * а SDK за него (пилюля быстрого вопроса, AI-подсказка, заглушка вложения), не слова клиента: сервер
+ * не выбирает по нему язык беседы (пилюли приходят на языке страницы, заглушка — на языке SDK).
+ */
+internal object InputSource {
+    const val TYPED = "typed"
+    const val QUICK_QUESTION = "quick_question"
+    const val SUGGESTION = "suggestion"
+    const val FILES_PLACEHOLDER = "files_placeholder"
+}
 
 /** Тело ответа `POST /chat`. `message` бывает null (humans-only handover). */
 @Serializable
@@ -120,6 +138,15 @@ data class ChatResponseDto(
     @SerialName("human_handover") val humanHandover: Boolean = false,
     @SerialName("suggested_questions") val suggestedQuestions: List<String> = emptyList(),
     @SerialName("doc_links") val docLinks: List<DocLinkDto> = emptyList(),
+    /** Текст карточки «передано человеку» на языке клиента; есть на каждой ветке с `human_handover`. */
+    @SerialName("handover_card_text") val handoverCardText: String? = null,
+    /** Карточки статусов на языке клиента — на будущие WS-переходы. */
+    @SerialName("status_texts") val statusTexts: StatusTextsDto? = null,
+    /**
+     * Язык беседы после хода — тот же, что у события `conversation_updated{lang}`. На новой беседе
+     * SDK подписывается на неё только после этого ответа, и событие первого хода до него не доходит.
+     */
+    val lang: String? = null,
     // Внимание: сюда НЕ добавляются ticket_url / ticket_id и любые другие ссылки
     // на внутренние системы. Это customer-facing DTO; зеркалит
     // backend/internal/api/handlers/chat_dto.go, где их тоже нет.

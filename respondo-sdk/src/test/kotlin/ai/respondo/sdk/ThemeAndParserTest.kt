@@ -119,11 +119,9 @@ class ThemeAndParserTest {
 
     @Test
     fun localeDetect_priority() {
-        assertEquals("ru", LocaleDetect.detect(storedLang = "ru-RU", firstUserText = "hello", systemLocale = "en"))
-        assertEquals("uk", LocaleDetect.detect(storedLang = null, firstUserText = "Привіт, як справи?", systemLocale = "en"))
-        assertEquals("ru", LocaleDetect.detect(storedLang = null, firstUserText = "Здравствуйте", systemLocale = "en"))
-        assertEquals("en", LocaleDetect.detect(storedLang = null, firstUserText = null, systemLocale = "xx"))
-        assertEquals("de", LocaleDetect.detect(storedLang = null, firstUserText = null, systemLocale = "de-DE"))
+        assertEquals("ru", LocaleDetect.detect(storedLang = "ru-RU", systemLocale = "en"))
+        assertEquals("en", LocaleDetect.detect(storedLang = null, systemLocale = "xx"))
+        assertEquals("de", LocaleDetect.detect(storedLang = null, systemLocale = "de-DE"))
     }
 
     // --- лимит сообщения (750) ---

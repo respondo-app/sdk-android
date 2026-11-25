@@ -5,6 +5,7 @@ import ai.respondo.sdk.internal.RespondoLog
 import ai.respondo.sdk.internal.respondoJson
 import ai.respondo.sdk.transport.dto.MessageDto
 import ai.respondo.sdk.transport.dto.MessageUpdateDto
+import ai.respondo.sdk.transport.dto.StatusTextsDto
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -19,6 +20,12 @@ sealed interface RealtimeEvent {
 
     /** Смена статуса/обработчика беседы (escalated / agent / resolved / bot). */
     data class StatusChanged(val conversationId: String, val newStatus: String) : RealtimeEvent
+
+    /**
+     * Карточки статусов на языке клиента из ответа поллинга (`status_texts`). Не кадр сокета:
+     * поллинг отдаёт их до перехода статуса, и контроллер рисует карточку ими.
+     */
+    data class StatusTexts(val conversationId: String, val texts: StatusTextsDto) : RealtimeEvent
 
     /** Оператор печатает. */
     data class Typing(val conversationId: String, val isTyping: Boolean, val authorName: String?) : RealtimeEvent

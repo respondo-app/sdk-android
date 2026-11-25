@@ -8,22 +8,24 @@ sealed interface HttpBody {
     /** JSON-тело (`application/json`). */
     data class Json(val text: String) : HttpBody
 
-    /** Multipart-тело с единственным файловым полем (для `/chat/upload`). */
+    /** Multipart-тело: файловая часть плюс текстовые поля формы (для `/chat/upload`). */
     data class Multipart(
         val fieldName: String,
         val filename: String,
         val contentType: String,
         val bytes: ByteArray,
+        val fields: Map<String, String> = emptyMap(),
     ) : HttpBody {
         override fun equals(other: Any?): Boolean =
             other is Multipart && fieldName == other.fieldName && filename == other.filename &&
-                contentType == other.contentType && bytes.contentEquals(other.bytes)
+                contentType == other.contentType && bytes.contentEquals(other.bytes) && fields == other.fields
 
         override fun hashCode(): Int {
             var result = fieldName.hashCode()
             result = 31 * result + filename.hashCode()
             result = 31 * result + contentType.hashCode()
             result = 31 * result + bytes.contentHashCode()
+            result = 31 * result + fields.hashCode()
             return result
         }
     }

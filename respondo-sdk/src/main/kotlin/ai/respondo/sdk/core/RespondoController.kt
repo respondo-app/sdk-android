@@ -7,6 +7,7 @@ import ai.respondo.sdk.RespondoListener
 import ai.respondo.sdk.RespondoPushPayload
 import ai.respondo.sdk.config.ConfigStore
 import ai.respondo.sdk.i18n.LocaleDetect
+import ai.respondo.sdk.i18n.MessageDateFormatter
 import ai.respondo.sdk.i18n.OfficeHoursDisplay
 import ai.respondo.sdk.i18n.OfficeHoursFormatter
 import ai.respondo.sdk.i18n.Strings
@@ -16,6 +17,7 @@ import ai.respondo.sdk.internal.KeyValueStore
 import ai.respondo.sdk.internal.RespondoLog
 import ai.respondo.sdk.internal.SdkInfo
 import ai.respondo.sdk.internal.isBackendId
+import ai.respondo.sdk.internal.respondoJson
 import ai.respondo.sdk.internal.toJsonElement
 import ai.respondo.sdk.push.PushHost
 import ai.respondo.sdk.push.PushManager
@@ -29,17 +31,25 @@ import ai.respondo.sdk.transport.ApiClient
 import ai.respondo.sdk.transport.ApiException
 import ai.respondo.sdk.transport.HistoryOutcome
 import ai.respondo.sdk.transport.ResumeOutcome
+import ai.respondo.sdk.transport.dto.AppSessionRequestDto
 import ai.respondo.sdk.transport.dto.ChatAttachmentDto
 import ai.respondo.sdk.transport.dto.ChatIdentityDto
 import ai.respondo.sdk.transport.dto.ChatRequestDto
 import ai.respondo.sdk.transport.dto.ChatResponseDto
 import ai.respondo.sdk.transport.dto.DocLinkDto
+import ai.respondo.sdk.transport.dto.InputSource
 import ai.respondo.sdk.transport.dto.MessageDto
 import ai.respondo.sdk.transport.dto.MessageUpdateDto
+import ai.respondo.sdk.transport.dto.RatingErrorDto
+import ai.respondo.sdk.transport.dto.RatingRequestDto
+import ai.respondo.sdk.transport.dto.StatusTextsDto
 import ai.respondo.sdk.transport.dto.TrackEventRequestDto
 import ai.respondo.sdk.transport.dto.WidgetConfigDto
+import ai.respondo.sdk.transport.dto.WidgetIdentifyRequestDto
 import android.content.Context
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -54,6 +64,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Центральный оркестратор чат-ядра: optimistic send, каскад реалтайма, resume/история, unread, эскалация,
@@ -68,6 +79,10 @@ internal class RespondoController(
     private val apiClient: ApiClient,
     okHttpClient: OkHttpClient,
     private val store: KeyValueStore,
+    /** Правило сессий приложения; общий на процесс (переживает re-init). Тесты подставляют свой. */
+    private val sessionTracker: AppSessionTracker = AppSessionTracker.shared,
+    /** Дедуп `POST /widget/identify`; общий на процесс, как у веб-виджета. */
+    private val identifySync: IdentifySync = IdentifySync.shared,
 ) {
     private val app: Context = appContext.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -85,7 +100,20 @@ internal class RespondoController(
         onEvent = ::onRealtimeEvent,
     )
 
-    private val pushManager = PushManager(apiClient, PushHostImpl(), scope)
+    // Регистрация токена ждёт ответа identify в полёте: не создаёт контакт раньше `/widget/identify`.
+    private val pushManager = PushManager(apiClient, PushHostImpl(), scope, awaitIdentity = ::awaitIdentifyIdle)
+
+    /**
+     * Последний `POST /widget/identify` ([start] или [identify]); по нему сессия приложения и регистрация
+     * push-токена ждут ответа ([awaitIdentifyIdle]).
+     */
+    @Volatile private var identifyJob: Job? = null
+
+    /**
+     * Отметка запуска решена и ждёт ответа identify: уйдёт она ([sendAppSession]) или разобранный контроллер
+     * вернёт запуск трекеру ([destroy]) — ровно одно из двух.
+     */
+    private val launchUnsent = AtomicBoolean(false)
 
     /** Engagement-слой (news/surveys/banners/checklists/proactive). UI и фасад читают его наблюдаемые. */
     internal val engagement = EngagementController(apiClient, EngagementHostImpl(), scope, store)
@@ -121,6 +149,9 @@ internal class RespondoController(
     private val _agentHasReplied = MutableStateFlow(false)
     val agentHasReplied: StateFlow<Boolean> = _agentHasReplied.asStateFlow()
 
+    /** input_source неотправленных реплик по localId — retry шлёт тот же источник, что и первая попытка. */
+    private val inputSources = java.util.concurrent.ConcurrentHashMap<String, String>()
+
     private val _suggestedQuestions = MutableStateFlow<List<String>>(emptyList())
     val suggestedQuestions: StateFlow<List<String>> = _suggestedQuestions.asStateFlow()
 
@@ -148,6 +179,20 @@ internal class RespondoController(
     private val _messageError = MutableStateFlow<String?>(null)
     val messageError: StateFlow<String?> = _messageError.asStateFlow()
 
+    /** Оценка беседы (CSAT 1–5) и отзыв нынешнего закрытия (behavior.md §12). */
+    private val _rating = MutableStateFlow(ConversationRating())
+    val rating: StateFlow<ConversationRating> = _rating.asStateFlow()
+
+    /** Блок оценки — только под закрытой беседой, чьё закрытие попросило оценку. */
+    private val _ratingVisible = MutableStateFlow(false)
+    val ratingVisible: StateFlow<Boolean> = _ratingVisible.asStateFlow()
+
+    private val _ratingSaving = MutableStateFlow(false)
+    val ratingSaving: StateFlow<Boolean> = _ratingSaving.asStateFlow()
+
+    private val _remarkSaving = MutableStateFlow(false)
+    val remarkSaving: StateFlow<Boolean> = _remarkSaving.asStateFlow()
+
     // --- рабочее состояние ---
     @Volatile private var conversationId: String? = null
     @Volatile private var sessionToken: String? = null
@@ -165,6 +210,19 @@ internal class RespondoController(
     @Volatile private var historyConversationId: String? = null
     @Volatile private var oldestMessageId: String? = null
     @Volatile private var lastBackendMsgId: String? = null
+
+    /**
+     * Последние карточки статусов на языке клиента (`status_texts` сервера из poll, resume, `/chat`
+     * и `/escalate`). Кадр WS `status_changed` языка не несёт — карточки «вернулся к ИИ» и «чат
+     * завершён» рисуются ими, строки SDK — фолбэк. Пишется только через [rememberStatusTexts] /
+     * [forgetStatusTexts] под [statusTextsLock]: мерж — read-modify-write из параллельных корутин.
+     */
+    @Volatile private var statusTexts = ControllerLogic.StatusTexts()
+    private val statusTextsLock = Any()
+
+    /** Запомненные карточки статусов (для тестов). */
+    internal val rememberedStatusTexts: ControllerLogic.StatusTexts get() = statusTexts
+
     @Volatile private var configLoaded = false
     @Volatile private var listener: RespondoListener? = null
 
@@ -191,12 +249,19 @@ internal class RespondoController(
             return
         }
         identityStore.visitorId() // гарантируем создание анонимного визитёра
+        // Сохранённый язык беседы стартует UI только для продолжаемой беседы: новая беседа
+        // определяет язык на сервере заново (локаль устройства, затем детектор).
+        val resuming = conversationCache.load(config.agentId, config.channelId)?.conversationId != null
         val initialLang = LocaleDetect.detect(
-            storedLang = identityStore.lang,
-            firstUserText = null,
+            storedLang = if (resuming) identityStore.lang else null,
             systemLocale = config.locale ?: systemLocale(),
         )
         setLang(initialLang, persist = false)
+
+        // Стартовая личность (и её свойства) — в профиль сразу. Сессию приложения init НЕ шлёт: процесс мог
+        // подняться в фоне (FCM, WorkManager); запуск — первый ON_START процесса
+        // ([onProcessForeground], ProcessForegroundWatcher), и отметка ждёт ответа этого identify.
+        syncIdentity()
 
         // Мгновенно применяем кэш конфига и беседы.
         configStore.load(config.agentId, config.channelId, currentLang())?.let { applyConfig(it) }
@@ -256,8 +321,12 @@ internal class RespondoController(
     private fun applyConfig(dto: WidgetConfigDto) {
         _theme.value = ThemeMapper.resolve(dto, config.themeOverride)
         _officeHours.value = OfficeHoursFormatter.format(dto.officeHours, currentLang())
-        // visitor_language с бэкенда переключает локаль и персистится.
-        dto.visitorLanguage?.takeIf { Strings.normalize(it) != currentLang() }?.let { setLang(it, persist = true) }
+        // visitor_language с бэкенда переключает локаль и персистится — только для
+        // продолжаемой беседы (conversationId из кэша), как у виджета: новая беседа
+        // определяет язык на сервере заново, язык прошлого диалога UI не ведёт.
+        if (conversationId != null) {
+            dto.visitorLanguage?.takeIf { it.isNotBlank() }?.let { applyServerLang(it) }
+        }
         // Обновить приветственный пузырь, если тред пуст (под messagesMutex, поэтому на скоупе).
         scope.launch { refreshGreetingContent() }
     }
@@ -308,6 +377,8 @@ internal class RespondoController(
             conversationClosed = false
             next.conversationId?.let { realtimeChannel.setConversation(it) }
         }
+        // Живая беседа (или продолжение) — блока оценки прошлого закрытия нет.
+        setRating(_rating.value)
     }
 
     private suspend fun applyResume(data: ai.respondo.sdk.transport.dto.ResumeResponseDto) {
@@ -319,7 +390,17 @@ internal class RespondoController(
         // здесь только одно — есть ли ещё что слушать на этой строке.
         conversationId = data.conversationId
         sessionToken = data.sessionToken
+        rememberStatusTexts(data.statusTexts)
         conversationClosed = ControllerLogic.isClosedStatus(data.status)
+        setRating(
+            ControllerLogic.nextRating(
+                _rating.value,
+                data.conversationId,
+                data.ratingRequested,
+                value = data.visitorRating ?: 0,
+                remark = ControllerLogic.serverRemark(data.ratingRemark, data.ratingRemarkEditable),
+            ),
+        )
         setEscalated(data.status == "escalated")
         val restored = data.messages.map { ChatMessage.fromDto(it) }
         restored.forEach { seenMessageIds.add(it.id) }
@@ -355,12 +436,31 @@ internal class RespondoController(
         // Другой контакт: опросы и доставки прежнего (и его запросы в полёте) ему не достаются;
         // события сессии прежнего пользователя — тоже, если он не был анонимом
         // (аноним → пользователь — тот же человек).
-        if (prevKey != ControllerLogic.contactKey(identity)) {
+        val newKey = ControllerLogic.contactKey(identity)
+        val switched = prevKey != newKey
+        if (switched) {
             engagement.identityChanged(fromAnonymous = prevKey.first == null && prevKey.second == null)
         }
-        // Устройство — к контакту новой личности: токен, полученный до логина,
-        // иначе навсегда оставался на анонимном контакте визитёра.
-        pushManager.reRegister()
+        // Личность (контакт создаётся сразу) и свойства — в профиль, не дожидаясь чата. Другой
+        // известный контакт — сессия приложения достаётся ему сразу (как Intercom на первой
+        // регистрации пользователя), без 20-секундного порога, но ПОСЛЕ ответа на identify: новый
+        // контакт создаётся с его атрибутами, именем и датой регистрации, а не пустым из отметки. Оба кузова собираются
+        // сейчас — из этой личности, даже если следующий identify() придёт раньше отправки.
+        val identifyClaim = claimIdentify()
+        val known = newKey.first != null || newKey.second != null
+        // Трекер решает до сборки тела: в фоне (процесс без ON_START) сессии нет.
+        val hasChannel = !config.channelId.isNullOrBlank()
+        val session = if (switched && known && hasChannel && sessionTracker.contactChanged()) appSessionBody() else null
+        // Устройство — к контакту новой личности (токен, полученный до логина, иначе навсегда
+        // оставался на анонимном контакте визитёра) — тоже ПОСЛЕ ответа identify, как сессия:
+        // регистрация токена не опережает /widget/identify и не создаёт контакт первой. Ответ
+        // created (контакт создан этим identify) — сокет переидентифицируется: кадр ниже мог
+        // прийти раньше, чем контакт появился.
+        launchIdentify(send = { identifyClaim?.let { sendIdentify(it) } ?: false }) { created ->
+            session?.let { sendAppSession(it) }
+            pushManager.reRegister()
+            if (created) realtimeChannel.reIdentify()
+        }
         realtimeChannel.reIdentify()
         conversationId?.let { realtimeChannel.setConversation(it) }
         // Каталоги overlay пересчитываются под известного контакта.
@@ -370,19 +470,21 @@ internal class RespondoController(
     fun track(name: String, properties: Map<String, Any?>) {
         if (name.isBlank()) return
         val id = identityStore.currentIdentity()
+        // Тело (личность) — сейчас; событие — после ответа identify в полёте (успех или сбой): иначе
+        // /widget/events создавал контакт по user_id без email.
+        val event = TrackEventRequestDto(
+            agentId = config.agentId.ifEmpty { null },
+            channelId = config.channelId,
+            visitorId = identityStore.visitorId(),
+            email = id.email,
+            userId = id.userId,
+            userHash = id.userHash,
+            name = name.trim(),
+            properties = properties.mapValues { it.value.toJsonElement() },
+        )
         scope.launch {
-            apiClient.track(
-                TrackEventRequestDto(
-                    agentId = config.agentId.ifEmpty { null },
-                    channelId = config.channelId,
-                    visitorId = identityStore.visitorId(),
-                    email = id.email,
-                    userId = id.userId,
-                    userHash = id.userHash,
-                    name = name.trim(),
-                    properties = properties.mapValues { it.value.toJsonElement() },
-                ),
-            )
+            awaitIdentifyIdle()
+            apiClient.track(event)
         }
         // Событие-триггер оверлей-опроса срабатывает сразу, без сетевого круга.
         engagement.eventTracked(name)
@@ -458,6 +560,8 @@ internal class RespondoController(
             resolvedResetJob?.cancel()
             setEscalated(false)
             _agentHasReplied.value = false
+            forgetStatusTexts()
+            setRating(ConversationRating())
             _suggestedQuestions.value = emptyList()
             _emailCollectorRequired.value = false
             resetUnread()
@@ -467,24 +571,200 @@ internal class RespondoController(
             // 5. Переустановить реалтайм под новым визитёром и перерегистрировать push.
             realtimeChannel.setConversation(null)
             realtimeChannel.reIdentify()
+            pushManager.dropPendingOpens()
             pushManager.reRegister()
             engagement.loadCatalogs()
         }
     }
 
     fun destroy() {
+        // Отметка запуска ещё ждёт ответа identify и с этим контроллером не уйдёт: запуск снова не сообщён —
+        // его сообщит следующий контроллер ([AppSessionTracker.launchDropped]).
+        if (launchUnsent.compareAndSet(true, false)) sessionTracker.launchDropped()
         realtimeChannel.destroy()
         listener = null
         scope.cancel()
     }
 
+    /** Host: приложение ушло в фон — только реалтайм (сессии ведёт [onProcessBackground]). */
     fun onBackground() = realtimeChannel.notifyBackground()
+
+    /** Host: приложение вернулось — только реалтайм (сессии ведёт [onProcessForeground]). */
     fun onForeground() = realtimeChannel.notifyForeground()
+
+    /** Процесс ушёл в фон (ON_STOP `ProcessLifecycleOwner`): отметка для правила сессий. */
+    fun onProcessBackground() = sessionTracker.wentBackground()
+
+    /**
+     * Процесс перешёл на передний план (ON_START `ProcessLifecycleOwner`): первый раз — открытие
+     * приложения, дальше — возврат после не меньше 20 с в фоне ([AppSessionTracker.processStarted]).
+     */
+    fun onProcessForeground() {
+        // Без канала отметка не уходит — трекер не считает запуск сообщённым.
+        val canReport = !config.channelId.isNullOrBlank()
+        val isLaunch = !sessionTracker.launchSeen
+        if (sessionTracker.processStarted(canReport)) reportAppSession(isLaunch)
+    }
+
+    // ==================== identify-атрибуты и сессии приложения ====================
+
+    /** Кузов `POST /widget/identify`, уже отмеченный в [IdentifySync], и его ключ дедупа. */
+    private class IdentifyClaim(val body: WidgetIdentifyRequestDto, val key: String)
+
+    /**
+     * `POST /widget/identify`, как `syncIdentity` веб-виджета: личность с `userId`/`email` создаёт
+     * контакт сразу, даже без свойств (вход пользователя в Intercom Messenger); свойства (с
+     * `language_override`) и `signedUpAt` едут тем же кузовом. Только с каналом; аноним без свойств —
+     * нечего слать; тот же кузов дважды не уходит ([IdentifySync]); неудача сбрасывает дедуп.
+     * Best-effort. Стартовая личность уходит отсюда из [start] (internal — тесты гоняют этот шаг без сокета).
+     */
+    internal fun syncIdentity() {
+        val claim = claimIdentify() ?: return
+        launchIdentify(send = { sendIdentify(claim) }) { created ->
+            if (created) realtimeChannel.reIdentify()
+        }
+    }
+
+    /**
+     * Работа identify, отмеченная в [identifyJob] до первого шага: [send] — запрос (уходит сразу, рядом с
+     * прежними), [after] — то, что ждёт ответа и его, и прежних identify в полёте (то же тело второй раз не
+     * уходит — ответ на него даст прежний запрос). Работа завершается после прежней: конец последней —
+     * в полёте не осталось ни одного identify.
+     */
+    @Synchronized
+    private fun launchIdentify(send: suspend () -> Boolean, after: suspend (created: Boolean) -> Unit) {
+        val previous = identifyJob
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            val created = send()
+            previous?.join()
+            after(created)
+        }
+        identifyJob = job
+        job.start()
+    }
+
+    /**
+     * Ждёт, пока не останется `POST /widget/identify` в полёте (успех или сбой — неважно), в том числе
+     * запущенного за время ожидания. Сессия приложения и регистрация push-токена не опережают ответ
+     * identify: иначе контакт создавала отметка по user_id — без email, и импортированная строка с этим
+     * email к нему не присоединялась (`init(context, config, identity)`).
+     */
+    private suspend fun awaitIdentifyIdle() {
+        while (true) {
+            val job = identifyJob ?: return
+            job.join()
+            if (identifyJob === job) return
+        }
+    }
+
+    /**
+     * Кузов identify текущей личности; null — слать нечего (аноним без свойств, нет канала) или он уже
+     * ушёл.
+     */
+    private fun claimIdentify(): IdentifyClaim? {
+        val channelId = config.channelId?.takeIf { it.isNotBlank() } ?: return null
+        val id = identityStore.currentIdentity()
+        val props = id.effectiveProperties
+        val contactKey = ControllerLogic.contactKey(id)
+        if (props.isEmpty() && contactKey.first == null && contactKey.second == null) return null
+        val body = WidgetIdentifyRequestDto(
+            agentId = config.agentId.ifEmpty { null },
+            channelId = channelId,
+            visitorId = identityStore.visitorId(),
+            email = id.email,
+            userId = id.userId,
+            userHash = id.userHash,
+            name = id.name,
+            properties = props.toSortedMap(),
+            signedUpAt = id.signedUpAtSeconds,
+        )
+        val key = respondoJson.encodeToString(WidgetIdentifyRequestDto.serializer(), body)
+        if (!identifySync.claim(key)) return null
+        return IdentifyClaim(body, key)
+    }
+
+    /**
+     * Отправка identify; неудача снимает дедуп, следующий identify() повторит. Отмена ([destroy] в полёте) —
+     * тоже: ответа нет, и новый контроллер той же личности шлёт её снова. true — сервер создал
+     * контакт личности этим вызовом (`created`).
+     */
+    private suspend fun sendIdentify(claim: IdentifyClaim): Boolean {
+        val outcome = try {
+            apiClient.identifyOutcome(claim.body)
+        } catch (e: CancellationException) {
+            identifySync.failed(claim.key)
+            throw e
+        }
+        if (!outcome.sent) identifySync.failed(claim.key)
+        return outcome.created
+    }
+
+    /**
+     * `POST /widget/app-session` текущей личности ([sendAppSession]); [isLaunch] — отметка запуска процесса.
+     * Без канала (`channelId`) не шлётся. Best-effort.
+     */
+    private fun reportAppSession(isLaunch: Boolean) {
+        val body = appSessionBody() ?: return
+        if (isLaunch) launchUnsent.set(true)
+        sendAppSession(body, isLaunch)
+    }
+
+    /**
+     * Отметка сессии — после ответа identify в полёте ([awaitIdentifyIdle]), в том числе начатого позже; тело
+     * (личность) — на момент решения. Отметку запуска, которую разобранный контроллер уже вернул трекеру
+     * ([destroy]), не шлёт.
+     */
+    private fun sendAppSession(body: AppSessionRequestDto, isLaunch: Boolean = false) {
+        scope.launch {
+            awaitIdentifyIdle()
+            if (isLaunch && !launchUnsent.compareAndSet(true, false)) return@launch
+            apiClient.appSession(body)
+        }
+    }
+
+    /**
+     * Кузов сессии приложения текущей личности — платформа, приложение, версии, язык устройства и
+     * имя (сервер берёт его, только если отметка создаёт контакт); null — нет канала.
+     */
+    private fun appSessionBody(): AppSessionRequestDto? {
+        val channelId = config.channelId?.takeIf { it.isNotBlank() } ?: return null
+        val id = identityStore.currentIdentity()
+        return AppSessionRequestDto(
+            agentId = config.agentId.ifEmpty { null },
+            channelId = channelId,
+            visitorId = identityStore.visitorId(),
+            email = id.email,
+            userId = id.userId,
+            userHash = id.userHash,
+            name = id.name?.takeIf { it.isNotBlank() },
+            platform = SdkInfo.PLATFORM,
+            appId = runCatching { app.packageName }.getOrNull()?.takeIf { it.isNotBlank() },
+            appVersion = device.appVersion.takeIf { it.isNotBlank() && it != "unknown" },
+            sdkName = SdkInfo.SOURCE,
+            sdkVersion = SdkInfo.VERSION,
+            locale = config.locale?.takeIf { it.isNotBlank() } ?: deviceLocaleTag(),
+        )
+    }
+
+    /** Полный тег языка устройства (`ru-RU`): язык контакта на сервере, ниже явного languageOverride. */
+    private fun deviceLocaleTag(): String? {
+        val tag = runCatching { app.resources.configuration.locales[0].toLanguageTag() }.getOrNull()
+            ?: runCatching { java.util.Locale.getDefault().toLanguageTag() }.getOrNull()
+        return tag?.takeIf { it.isNotBlank() && it != "und" }
+    }
 
     // ==================== отправка сообщения ====================
 
     /** Отправляет сообщение с optimistic UI, забирая ожидающие вложения. При email_collector-гейте без email — блокирует. */
-    fun sendMessage(text: String) {
+    fun sendMessage(text: String) = send(text, InputSource.TYPED)
+
+    /** Пилюля быстрого вопроса: текст набрал SDK, а не посетитель (input_source=quick_question). */
+    internal fun sendQuickQuestion(text: String) = send(text, InputSource.QUICK_QUESTION)
+
+    /** AI-подсказка после ответа: текст набрал SDK, а не посетитель (input_source=suggestion). */
+    internal fun sendSuggestion(text: String) = send(text, InputSource.SUGGESTION)
+
+    private fun send(text: String, inputSource: String) {
         val trimmed = text.trim()
         val attachments = _pendingAttachments.value
         if (trimmed.isEmpty() && attachments.isEmpty()) return
@@ -499,7 +779,7 @@ internal class RespondoController(
         }
         _messageError.value = null
         _pendingAttachments.value = emptyList()
-        scope.launch { performSend(trimmed, attachments) }
+        scope.launch { performSend(trimmed, attachments, inputSource = inputSource) }
     }
 
     fun clearMessageError() { _messageError.value = null }
@@ -516,7 +796,14 @@ internal class RespondoController(
         }
         scope.launch {
             try {
-                val uploaded = apiClient.uploadFile(bytes, filename, contentType)
+                val uploaded = apiClient.uploadFile(
+                    bytes = bytes,
+                    filename = filename,
+                    contentType = contentType,
+                    agentId = config.agentId,
+                    conversationId = conversationId,
+                    auth = identityStore.authParams(sessionToken),
+                )
                 _pendingAttachments.value = _pendingAttachments.value + uploaded
                 _attachmentError.value = null
             } catch (e: Exception) {
@@ -540,7 +827,12 @@ internal class RespondoController(
             updateMessage(localId) { it.copy(sendStatus = SendStatus.SENDING) }
             // Отправляем исходный текст (для файловых сообщений он пуст), а не displayContent с именами файлов —
             // так performSend снова выберет fileSentPlaceholder и не пошлёт имена файлов как текст.
-            performSend(failed.originalText ?: failed.content, failed.attachments, existingLocalId = localId)
+            performSend(
+                failed.originalText ?: failed.content,
+                failed.attachments,
+                existingLocalId = localId,
+                inputSource = inputSources[localId] ?: InputSource.TYPED,
+            )
         }
     }
 
@@ -548,6 +840,7 @@ internal class RespondoController(
         rawText: String,
         attachments: List<ChatAttachmentDto>,
         existingLocalId: String? = null,
+        inputSource: String = InputSource.TYPED,
     ) {
         // Отложенный resolved-сброс не должен обнулить беседу под отправляемое сообщение.
         resolvedResetJob?.cancel()
@@ -564,13 +857,18 @@ internal class RespondoController(
             text
         }
 
+        // Заглушка вложения — текст SDK, не слова посетителя (сервер не выбирает по ней язык).
+        val source = if (text.isEmpty() && attachments.isNotEmpty()) InputSource.FILES_PLACEHOLDER else inputSource
+
         val localId = existingLocalId ?: ai.respondo.sdk.internal.Ids.newLocalMessageId()
+        inputSources[localId] = source
         if (existingLocalId == null) {
             val optimistic = ChatMessage(
                 id = localId,
                 role = MessageRole.USER,
                 content = displayContent,
                 attachments = attachments,
+                createdAt = MessageDateFormatter.nowRfc3339(),
                 sendStatus = SendStatus.SENDING,
                 isLocal = true,
                 // Храним исходный текст пользователя отдельно от displayContent (для файлов это имена файлов),
@@ -581,8 +879,8 @@ internal class RespondoController(
         }
         _suggestedQuestions.value = emptyList()
         _isLoading.value = true
-        // Переопределяем локаль по тексту пользователя (как веб).
-        LocaleDetect.detectFromText(text)?.let { setLang(it, persist = true) }
+        // Язык по тексту пользователя SDK не определяет: язык беседы решает сервер и возвращает его
+        // полем `lang` ответа (applyServerLang).
 
         val request = ChatRequestDto(
             agentId = config.agentId,
@@ -594,10 +892,12 @@ internal class RespondoController(
             attachments = attachments.ifEmpty { null },
             identity = buildIdentityDto(),
             sessionToken = sessionToken,
+            inputSource = source,
         )
 
         try {
             val response = apiClient.postChat(request)
+            inputSources.remove(localId)
             updateMessage(localId) { it.copy(sendStatus = SendStatus.SENT) }
             applyChatResponse(response)
         } catch (e: ApiException) {
@@ -608,6 +908,7 @@ internal class RespondoController(
                 sessionToken = null
                 conversationClosed = false
                 realtimeChannel.setConversation(null)
+                setRating(ConversationRating())
             }
             RespondoLog.w("отправка не удалась (HTTP ${e.code})", e)
             updateMessage(localId) { it.copy(sendStatus = SendStatus.FAILED) }
@@ -624,15 +925,34 @@ internal class RespondoController(
         // Другой id означает, что закрытая строка форкнулась: с этого момента беседа пользователя —
         // новая, и остаться на старой значило бы форкать её снова каждым сообщением.
         adoptSession(response.conversationId, response.sessionToken)
+        // Карточки статусов на языке клиента — на будущие WS-переходы.
+        rememberStatusTexts(response.statusTexts)
+        // Язык беседы после хода — как событие conversation_updated{lang}: на новую беседу подписка
+        // начинается после этого ответа, и событие первого хода до SDK не доходит.
+        response.lang?.takeIf { it.isNotBlank() }?.let { applyServerLang(it) }
 
         val msg = response.message
         when {
             response.humanHandover && _escalated.value -> {
                 // Уже escalated — держим состояние.
             }
-            response.humanHandover && msg != null && ChatMessage.normalizeRole(msg.role) != MessageRole.USER -> {
-                addBackendMessage(msg)
-                addSystemMessage(Strings.get(currentLang(), "escalatedMessage"), "escalated-system")
+            response.humanHandover -> {
+                // Передача на ЛЮБОЙ ветке, пока клиент не escalated: уведомление ответа — пузырь;
+                // без уведомления (humans-only) и на эхе реплики клиента (тред уже у людей) —
+                // только карточка, как веб и iOS. Эхо — не второй пузырь клиента: он уже нарисован
+                // оптимистично.
+                val notice = ControllerLogic.handoverNotice(msg)
+                notice?.let { addBackendMessage(it) }
+                // Стандартное уведомление — само карточка: пузырь уже говорит его текстом. Иначе
+                // карточка — на языке клиента (handover_card_text сервера), а не строкой SDK.
+                if (!ControllerLogic.isCannedHandover(notice)) {
+                    val card = ControllerLogic.handoverCardText(
+                        responseCardText = response.handoverCardText,
+                        notice = notice,
+                        fallback = Strings.get(currentLang(), "escalatedMessage"),
+                    )
+                    addSystemMessage(card, "escalated-system")
+                }
                 setEscalated(true)
             }
             msg != null -> {
@@ -672,14 +992,20 @@ internal class RespondoController(
                 // ответ до пользователя не доходил, а следующее сообщение форкало третью строку,
                 // выбивая вторую из цепочки.
                 adoptSession(result.conversationId, result.sessionToken)
+                rememberStatusTexts(result.statusTexts)
                 setEscalated(true)
                 _suggestedQuestions.value = emptyList()
-                val text = result.message ?: Strings.get(currentLang(), "escalatedMessage")
+                val text = ControllerLogic.serverTextOr(result.message, Strings.get(currentLang(), "escalatedMessage"))
                 // Карточка передачи оператору — без ссылок. Тикет-трекер это
                 // наша внутренняя кухня, клиенту она не показывается.
                 addSystemMessage(text, "escalate-card")
             } catch (e: IOException) {
-                addSystemMessage(Strings.get(currentLang(), "networkError"), "escalate-error")
+                // Отказ — серверный текст на языке клиента («передать не вышло»), если он есть.
+                val refusal = (e as? ApiException)?.let { ControllerLogic.escalateRefusalText(it.bodyText) }
+                addSystemMessage(
+                    ControllerLogic.serverTextOr(refusal, Strings.get(currentLang(), "networkError")),
+                    "escalate-error",
+                )
             } finally {
                 persistCache()
             }
@@ -693,7 +1019,10 @@ internal class RespondoController(
             // Переход разрешается локально даже при ошибке запроса.
             setEscalated(false)
             _agentHasReplied.value = false
-            addSystemMessage(Strings.get(currentLang(), "backToAI"), "back-to-ai-local")
+            addSystemMessage(
+                ControllerLogic.serverTextOr(statusTexts.backToAi, Strings.get(currentLang(), "backToAI")),
+                "back-to-ai-local",
+            )
             persistCache()
         }
     }
@@ -752,8 +1081,30 @@ internal class RespondoController(
         )
     }
 
-    private fun onRealtimeEvent(event: RealtimeEvent) {
+    /**
+     * Вход событий реалтайма. Каждое событие обрабатывается своей корутиной на Dispatchers.Default,
+     * и порядок между ними не гарантирован — поэтому тексты карточек ([RealtimeEvent.StatusTexts],
+     * поллинг шлёт их прямо перед переходом статуса) запоминаются СИНХРОННО, до запуска следующего
+     * события: переход `resolved`/`bot` рисует карточку уже ими, а не прежними текстами или строкой
+     * SDK. internal — для тестов контроллера.
+     */
+    internal fun onRealtimeEvent(event: RealtimeEvent) {
+        if (event is RealtimeEvent.StatusTexts) {
+            rememberStatusTexts(event.texts)
+            return
+        }
         scope.launch { handleRealtimeEvent(event) }
+    }
+
+    /** Мержит новые тексты карточек статусов поверх запомненных (атомарно). */
+    private fun rememberStatusTexts(next: StatusTextsDto?) {
+        if (next == null) return
+        synchronized(statusTextsLock) { statusTexts = ControllerLogic.mergeStatusTexts(statusTexts, next) }
+    }
+
+    /** Забывает тексты карточек: другой пользователь — другой язык. */
+    private fun forgetStatusTexts() {
+        synchronized(statusTextsLock) { statusTexts = ControllerLogic.StatusTexts() }
     }
 
     private suspend fun handleRealtimeEvent(event: RealtimeEvent) {
@@ -761,8 +1112,10 @@ internal class RespondoController(
             is RealtimeEvent.NewMessage -> onNewMessageEvent(event.message)
             is RealtimeEvent.MessageUpdated -> onMessageUpdated(event.update)
             is RealtimeEvent.StatusChanged -> onStatusChanged(event.newStatus)
+            // Запоминаются синхронно в onRealtimeEvent; ветка — для полноты when.
+            is RealtimeEvent.StatusTexts -> rememberStatusTexts(event.texts)
             is RealtimeEvent.Typing -> onTyping(event.isTyping, event.authorName)
-            is RealtimeEvent.ConversationUpdated -> event.lang?.let { setLang(it, persist = true) }
+            is RealtimeEvent.ConversationUpdated -> event.lang?.takeIf { it.isNotBlank() }?.let { applyServerLang(it) }
             is RealtimeEvent.CampaignConversation -> onCampaignConversation(event.conversationId, event.message)
             is RealtimeEvent.Subscribed -> RespondoLog.d("subscribed ${event.conversationId}")
             is RealtimeEvent.Error -> onRealtimeError(event.message)
@@ -810,11 +1163,17 @@ internal class RespondoController(
             "agent", "bot" -> {
                 if (_escalated.value) {
                     setEscalated(false)
-                    addSystemMessage(Strings.get(currentLang(), "backToAI"), "back-to-ai-ws")
+                    addSystemMessage(
+                        ControllerLogic.serverTextOr(statusTexts.backToAi, Strings.get(currentLang(), "backToAI")),
+                        "back-to-ai-ws",
+                    )
                 }
             }
             "resolved" -> {
-                addSystemMessage(Strings.get(currentLang(), "resolvedMessage"), "resolved-card")
+                addSystemMessage(
+                    ControllerLogic.serverTextOr(statusTexts.resolved, Strings.get(currentLang(), "resolvedMessage")),
+                    "resolved-card",
+                )
                 realtimeChannel.reIdentify() // ре-identify для пост-resolution CSAT
                 scheduleResolvedReset()
             }
@@ -838,7 +1197,125 @@ internal class RespondoController(
             _suggestedQuestions.value = emptyList()
             realtimeChannel.setConversation(null)
             persistCache()
+            // Просили ли оценить это закрытие, знает только опрос: сокет о запросе не говорит
+            // (behavior.md §12) — один опрос после закрытия.
+            refreshRating()
         }
+    }
+
+    // ==================== оценка беседы (CSAT) ====================
+
+    private fun setRating(next: ConversationRating) {
+        _rating.value = next
+        _ratingVisible.value = next.visibleFor(conversationId, conversationClosed)
+    }
+
+    /** Тексты блока оценки: серверные (язык клиента) поверх строк SDK. */
+    fun ratingLabel(key: String): String {
+        val t = statusTexts
+        val server = when (key) {
+            "ratingQuestion" -> t.ratingQuestion
+            "ratingThanks" -> t.ratingThanks
+            "ratingRemarkPrompt" -> t.ratingRemarkPrompt
+            "ratingRemarkPlaceholder" -> t.ratingRemarkPlaceholder
+            "ratingSend" -> t.ratingSend
+            "ratingEdit" -> t.ratingEdit
+            else -> null
+        }
+        return ControllerLogic.serverTextOr(server, Strings.get(currentLang(), key))
+    }
+
+    /** Один опрос беседы: запрос оценки, выбранная цифра и отзыв. */
+    internal suspend fun refreshRating() {
+        val cid = conversationId ?: return
+        val resp = apiClient.getMessages(cid, null, identityStore.authParams(sessionToken)) ?: return
+        if (cid != conversationId) return
+        rememberStatusTexts(resp.statusTexts)
+        // Выбор и отзыв, которые сейчас сохраняются, важнее ответа опроса.
+        val fresh = !_ratingSaving.value && !_remarkSaving.value
+        setRating(
+            ControllerLogic.nextRating(
+                _rating.value,
+                cid,
+                resp.ratingRequested,
+                value = if (fresh) resp.visitorRating else null,
+                remark = if (fresh) ControllerLogic.serverRemark(resp.ratingRemark, resp.ratingRemarkEditable) else null,
+            ),
+        )
+    }
+
+    /** Оценка 1–5: оптимистично, откат при отказе; 409 — оценку этого закрытия уже не просят. */
+    fun rate(score: Int) {
+        val cid = conversationId ?: return
+        if (_ratingSaving.value || score !in 1..5) return
+        val prev = _rating.value
+        setRating(prev.copy(value = score))
+        _ratingSaving.value = true
+        scope.launch {
+            try {
+                val resp = apiClient.rateConversation(cid, RatingRequestDto(score = score), identityStore.authParams(sessionToken))
+                if (cid == conversationId && (resp.remark != null || resp.remarkEditable != null)) {
+                    setRating(ControllerLogic.savedRemark(_rating.value, resp.remark ?: "", resp.remarkEditable ?: true))
+                }
+            } catch (e: ApiException) {
+                if (cid == conversationId) {
+                    setRating(if (e.code == 409) ControllerLogic.nextRating(_rating.value, cid, false) else prev)
+                }
+            } catch (e: Exception) {
+                if (cid == conversationId) setRating(prev)
+            } finally {
+                _ratingSaving.value = false
+            }
+        }
+    }
+
+    /**
+     * Отзыв («Tell us more») с текущей оценкой: одна запись и одна правка; 409 `remark locked` —
+     * Edit уходит. Другая ошибка — текст остаётся в поле (UI его не стирает). [onDone] — успех.
+     */
+    fun sendRemark(text: String, onDone: (Boolean) -> Unit = {}) {
+        val cid = conversationId ?: return onDone(false)
+        val trimmed = text.trim()
+        val current = _rating.value
+        if (_remarkSaving.value || current.value <= 0 || trimmed.isEmpty()) return onDone(false)
+        _remarkSaving.value = true
+        scope.launch {
+            var ok = false
+            try {
+                val resp = apiClient.rateConversation(
+                    cid, RatingRequestDto(score = current.value, remark = trimmed), identityStore.authParams(sessionToken),
+                )
+                if (cid == conversationId) {
+                    setRating(ControllerLogic.savedRemark(_rating.value, resp.remark ?: trimmed, resp.remarkEditable ?: false))
+                }
+                ok = true
+            } catch (e: ApiException) {
+                if (cid == conversationId && e.code == 409) {
+                    val locked = runCatching {
+                        respondoJson.decodeFromString(RatingErrorDto.serializer(), e.bodyText).error
+                    }.getOrNull() == "remark locked"
+                    setRating(
+                        if (locked) ControllerLogic.lockedRemark(_rating.value)
+                        else ControllerLogic.nextRating(_rating.value, cid, false),
+                    )
+                }
+            } catch (e: Exception) {
+                RespondoLog.w("rating remark: сетевой сбой", e)
+            } finally {
+                _remarkSaving.value = false
+                onDone(ok)
+            }
+        }
+    }
+
+    /** Нажали Edit у отправленного отзыва. */
+    fun editRemark() {
+        setRating(ControllerLogic.editRemark(_rating.value))
+    }
+
+    /** Поле правки покинули без изменений — назад к сохранённому отзыву. */
+    fun cancelRemarkEdit() {
+        setRating(ControllerLogic.cancelRemarkEdit(_rating.value))
     }
 
     private fun onTyping(isTyping: Boolean, authorName: String?) {
@@ -912,7 +1389,13 @@ internal class RespondoController(
 
     private suspend fun addSystemMessage(text: String, id: String) {
         if (!seenMessageIds.add(id)) return
-        val message = ChatMessage(id = id, role = MessageRole.SYSTEM, content = text, isLocal = true)
+        val message = ChatMessage(
+            id = id,
+            role = MessageRole.SYSTEM,
+            content = text,
+            createdAt = MessageDateFormatter.nowRfc3339(),
+            isLocal = true,
+        )
         messagesMutex.withLock { _messages.value = _messages.value + message }
     }
 
@@ -925,6 +1408,7 @@ internal class RespondoController(
             content = text,
             authorName = theme.agentName,
             authorAvatarUrl = theme.avatarUrl,
+            createdAt = MessageDateFormatter.nowRfc3339(),
             isLocal = true,
         )
         if (!seenMessageIds.add(message.id)) return
@@ -964,6 +1448,7 @@ internal class RespondoController(
                 content = theme.greeting,
                 authorName = theme.agentName,
                 authorAvatarUrl = theme.avatarUrl,
+                createdAt = MessageDateFormatter.nowRfc3339(),
                 isLocal = true,
             ),
         )
@@ -981,7 +1466,7 @@ internal class RespondoController(
             userHash = id.userHash,
             visitorId = identityStore.visitorId(),
             metadata = merged,
-            properties = id.properties,
+            properties = id.effectiveProperties,
         )
     }
 
@@ -1019,6 +1504,11 @@ internal class RespondoController(
     private fun setUnread(value: Int) {
         _unreadCount.value = value
         notifyMain { it.onUnreadChanged(value) }
+    }
+
+    /** Язык беседы, который дал сервер: переключает локаль и персистится (стартовая локаль следующего запуска). */
+    private fun applyServerLang(newLang: String) {
+        setLang(newLang, persist = true)
     }
 
     private fun setLang(newLang: String, persist: Boolean) {

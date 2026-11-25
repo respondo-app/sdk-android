@@ -189,6 +189,8 @@ class RealtimeChannel(
                     val auth = AuthParams(creds.sessionToken, creds.userHash, creds.visitorId)
                     val resp = apiClient.getMessages(cid, creds.lastBackendMsgId, auth)
                     resp?.messages?.forEach { onEvent(RealtimeEvent.NewMessage(cid, it)) }
+                    // Тексты карточек на языке клиента — до перехода статуса.
+                    resp?.statusTexts?.let { onEvent(RealtimeEvent.StatusTexts(cid, it)) }
                     resp?.status?.let { onEvent(RealtimeEvent.StatusChanged(cid, it)) }
                 }
                 delay(pollingInterval())

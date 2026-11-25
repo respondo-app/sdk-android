@@ -67,6 +67,10 @@ dependencies {
     implementation(libs.androidx.fragment.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
+    // ProcessLifecycleOwner: фон/передний план процесса для сессий приложения (ProcessForegroundWatcher) —
+    // события процесса, а не активити (поворот и A → B — не фон), фоновые старты (FCM, WorkManager)
+    // без ON_START. Та же версия lifecycle, что у runtime-compose; транзитивно — androidx.startup.
+    implementation(libs.androidx.lifecycle.process)
 
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
@@ -135,8 +139,10 @@ afterEvaluate {
                 }
             }
         }
-        // Публикация в локальный Maven-репозиторий (~/.m2) выполняется встроенной
-        // задачей publishToMavenLocal — отдельный repositories-блок не нужен.
-        // Реестр (Maven Central) подключается позже, когда заведут аккаунт Sonatype.
+        // Отдельный repositories-блок не нужен: публикация собирается встроенной
+        // задачей publishReleasePublicationToMavenLocal. В Maven Central бандл
+        // уходит вручную через Central Portal (подпись GPG, режим USER_MANAGED,
+        // кнопку Publish нажимает человек) — порядок выпуска описан в
+        // docs/wiki/features/integrations/mobile-sdk-releases.md.
     }
 }

@@ -5,6 +5,7 @@ import ai.respondo.sdk.push.PushManager
 import ai.respondo.sdk.push.PushRegistrationContext
 import ai.respondo.sdk.support.FakeHttpEngine
 import ai.respondo.sdk.transport.ApiClient
+import ai.respondo.sdk.transport.HttpBody
 import ai.respondo.sdk.transport.HttpResponse
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -112,6 +113,70 @@ class PushManagerTest {
         pm.handlePush(p)
         advanceUntilIdle()
         assertEquals(1, host.unhandled.size)
+    }
+
+    private fun campaign(deliveryId: String) = RespondoPushPayload.from(
+        mapOf("respondo" to """{"type":"campaign","message_id":"m-$deliveryId","delivery_id":"$deliveryId"}"""),
+    )!!
+
+    private fun FakeHttpEngine.opened() = requests.filter { it.url.contains("/api/v1/widget/push/opened") }
+
+    /** Тап раньше токена (getInitialMessage быстрее getToken): бикон открытия уходит, когда токен пришёл. */
+    @Test
+    fun tapBeforeToken_reportsTheOpenWhenTheTokenArrives() = runTest {
+        val engine = FakeHttpEngine { HttpResponse(200, "{}") }
+        val pm = PushManager(api(engine), FakeHost(), this)
+        pm.handlePush(campaign("d-1"))
+        advanceUntilIdle()
+        assertTrue("токена ещё нет", engine.opened().isEmpty())
+        pm.setPushToken("t")
+        advanceUntilIdle()
+        val body = (engine.opened().single().body as HttpBody.Json).text
+        assertTrue(body.contains("\"token\":\"t\""))
+        assertTrue(body.contains("\"delivery_id\":\"d-1\""))
+    }
+
+    /** clearPushToken (выход) снимает биконы, ждавшие токена: следующий токен их не отправит. */
+    @Test
+    fun clearPushToken_dropsTheOpensWaitingForAToken() = runTest {
+        val engine = FakeHttpEngine { HttpResponse(200, "{}") }
+        val pm = PushManager(api(engine), FakeHost(), this)
+        pm.handlePush(campaign("d-1"))
+        pm.clearPushToken()
+        pm.setPushToken("t")
+        advanceUntilIdle()
+        assertTrue(engine.opened().isEmpty())
+    }
+
+    /** Выход (reset): тапы прежнего пользователя, ждавшие токена, бикон не отправляют. */
+    @Test
+    fun dropPendingOpens_theOpensWaitingForATokenAreNotSent() = runTest {
+        val engine = FakeHttpEngine { HttpResponse(200, "{}") }
+        val pm = PushManager(api(engine), FakeHost(), this)
+        pm.handlePush(campaign("d-1"))
+        pm.dropPendingOpens()
+        pm.setPushToken("t")
+        advanceUntilIdle()
+        assertTrue(engine.opened().isEmpty())
+    }
+
+    /** То же тело регистрации второй раз не уходит; сбой снимает отметку — повтор уходит. */
+    @Test
+    fun register_sameBodyOnce_failureAllowsARetry() = runTest {
+        var status = 500
+        val engine = FakeHttpEngine { HttpResponse(status, "{}") }
+        val pm = PushManager(api(engine), FakeHost(), this)
+        fun registers() = engine.requests.count { it.url.contains("/api/v1/widget/push/register") }
+        pm.setPushToken("t")
+        advanceUntilIdle()
+        assertEquals(1, registers())
+        status = 200
+        pm.reRegister()
+        advanceUntilIdle()
+        assertEquals("после сбоя — повтор", 2, registers())
+        pm.reRegister()
+        advanceUntilIdle()
+        assertEquals("то же тело — не повторяется", 2, registers())
     }
 
     @Test

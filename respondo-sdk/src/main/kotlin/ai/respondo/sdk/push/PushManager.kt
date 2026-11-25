@@ -49,22 +49,49 @@ interface PushHost {
  * Клиентская часть пушей: регистрация/снятие токена, обработка тапа с дедупликацией по message_id
  * (общей с сообщениями, полученными по WS/REST — через [PushHost.hasSeenMessage]).
  */
-class PushManager(
+class PushManager @JvmOverloads constructor(
     private val apiClient: ApiClient,
     private val host: PushHost,
     private val scope: CoroutineScope,
+    /** Ждёт ответа `/widget/identify` в полёте: регистрация не создаёт контакт раньше identify. */
+    private val awaitIdentity: suspend () -> Unit = {},
 ) {
     @Volatile
     private var deviceToken: String? = null
 
-    /** Запоминает токен и регистрирует его на бэкенде. Токен переживает reset (перерегистрируется под новым визитёром). */
+    /**
+     * Тапы, обработанные раньше, чем стал известен токен ([reportOpened]): бикон открытия уходит, как только
+     * токен появится ([setPushToken]). Под `this`.
+     */
+    private val openedWithoutToken = ArrayDeque<RespondoPushPayload>()
+
+    /** Тело последней регистрации, ушедшей или в полёте (без `session_token` — сервер его не читает). Под `this`. */
+    private var lastRegistration: PushRegisterRequestDto? = null
+
+    /**
+     * Запоминает токен и регистрирует его на бэкенде. Токен переживает reset (перерегистрируется под новым
+     * визитёром). Биконы открытия, ждавшие токена, уходят сейчас.
+     */
     fun setPushToken(token: String) {
-        deviceToken = token
+        val waiting = synchronized(this) {
+            deviceToken = token
+            openedWithoutToken.toList().also { openedWithoutToken.clear() }
+        }
+        waiting.forEach(::reportOpened)
         register()
+    }
+
+    /** Выход (reset): тапы прежнего пользователя, ждавшие токена, бикон открытия не отправят. */
+    internal fun dropPendingOpens() {
+        synchronized(this) { openedWithoutToken.clear() }
     }
 
     /** Снимает регистрацию токена (logout). */
     fun clearPushToken() {
+        synchronized(this) {
+            openedWithoutToken.clear()
+            lastRegistration = null
+        }
         val token = deviceToken ?: return
         val ctx = host.registrationContext()
         val channelId = ctx.channelId
@@ -81,31 +108,42 @@ class PushManager(
     }
 
     private fun register() {
-        val token = deviceToken ?: return
-        val ctx = host.registrationContext()
-        val channelId = ctx.channelId
-        if (channelId.isNullOrEmpty()) {
+        if (deviceToken == null) return
+        if (host.registrationContext().channelId.isNullOrEmpty()) {
             RespondoLog.w("push register пропущен: channel_id не задан")
             return
         }
         scope.launch {
-            apiClient.pushRegister(
-                PushRegisterRequestDto(
-                    agentId = ctx.agentId,
-                    channelId = channelId,
-                    platform = SdkInfo.PLATFORM,
-                    token = token,
-                    appId = ctx.appId,
-                    locale = ctx.locale,
-                    sdkVersion = SdkInfo.VERSION,
-                    sdkName = SdkInfo.SOURCE,
-                    visitorId = ctx.visitorId,
-                    email = ctx.email,
-                    userId = ctx.userId,
-                    userHash = ctx.userHash,
-                    sessionToken = ctx.sessionToken,
-                ),
+            awaitIdentity()
+            // Токен и личность — на момент отправки: за ожидание токен могли снять или сменить.
+            val token = deviceToken ?: return@launch
+            val ctx = host.registrationContext()
+            val channelId = ctx.channelId ?: return@launch
+            val body = PushRegisterRequestDto(
+                agentId = ctx.agentId,
+                channelId = channelId,
+                platform = SdkInfo.PLATFORM,
+                token = token,
+                appId = ctx.appId,
+                locale = ctx.locale,
+                sdkVersion = SdkInfo.VERSION,
+                sdkName = SdkInfo.SOURCE,
+                visitorId = ctx.visitorId,
+                email = ctx.email,
+                userId = ctx.userId,
+                userHash = ctx.userHash,
+                sessionToken = ctx.sessionToken,
             )
+            // То же тело (токен, личность, визитёр) уже ушло или в полёте — не повторяем: на холодном старте
+            // регистрацию после ответа identify просят и setPushToken, и identify(). Сбой снимает отметку.
+            val key = body.copy(sessionToken = null)
+            synchronized(this@PushManager) {
+                if (key == lastRegistration) return@launch
+                lastRegistration = key
+            }
+            if (!apiClient.pushRegister(body)) {
+                synchronized(this@PushManager) { if (lastRegistration == key) lastRegistration = null }
+            }
         }
     }
 
@@ -148,8 +186,18 @@ class PushManager(
         reportOpened(payload)
     }
 
+    /**
+     * Бикон открытия. Сервер находит доставку по токену устройства; токена ещё нет (тап холодного старта:
+     * getInitialMessage раньше getToken) — бикон ждёт [setPushToken], не больше [OPENED_WITHOUT_TOKEN_CAP].
+     */
     private fun reportOpened(payload: RespondoPushPayload) {
-        val token = deviceToken ?: return
+        val token = synchronized(this) {
+            deviceToken ?: run {
+                openedWithoutToken.addLast(payload)
+                if (openedWithoutToken.size > OPENED_WITHOUT_TOKEN_CAP) openedWithoutToken.removeFirst()
+                null
+            }
+        } ?: return
         scope.launch {
             apiClient.pushOpened(
                 PushOpenedRequestDto(
@@ -159,5 +207,9 @@ class PushManager(
                 ),
             )
         }
+    }
+
+    private companion object {
+        const val OPENED_WITHOUT_TOKEN_CAP = 10
     }
 }

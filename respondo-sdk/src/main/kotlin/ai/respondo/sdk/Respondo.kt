@@ -1,6 +1,8 @@
 package ai.respondo.sdk
 
+import ai.respondo.sdk.core.AppSessionTracker
 import ai.respondo.sdk.core.CommandQueue
+import ai.respondo.sdk.core.ProcessForegroundWatcher
 import ai.respondo.sdk.core.QueuedCommand
 import ai.respondo.sdk.core.RespondoBanner
 import ai.respondo.sdk.core.RespondoController
@@ -76,11 +78,14 @@ object Respondo {
             RespondoLog.e("init: обязателен непустой agentId — вызов проигнорирован")
             return
         }
-        // Повторный init уничтожает старый инстанс, закрывает его HTTP-пул и очищает очередь.
+        // Личность init новее identify(), отложенных до него: проигранные после старта, они бы её откатили.
+        if (identity != null) queue.dropIdentify()
+        // Повторный init уничтожает старый инстанс и закрывает его HTTP-пул. Очередь не чистится: при живом
+        // контроллере вызовы в неё не попадают, destroy() её уже очистил, а вызовы до первого init (тап
+        // холодного старта, токен, identify) должны проиграться.
         controller?.destroy()
         engine?.close()
         engine = null
-        queue.clear()
 
         val appContext = context.applicationContext
         val baseUrl = config.baseUrl?.takeIf { it.isNotBlank() } ?: SdkInfo.DEFAULT_BASE_URL
@@ -96,6 +101,25 @@ object Respondo {
 
         // Проигрываем очередь в порядке поступления.
         queue.drain().forEach { replay(it, newController) }
+        // Запуск, который вернул разобранный контроллер (его отметка ждала ответа identify), — сейчас, если
+        // процесс на переднем плане; иначе его сообщит первый ON_START.
+        if (AppSessionTracker.shared.takeDroppedLaunch()) newController.onProcessForeground()
+
+        // Сессии приложения — по переходам процесса (ProcessLifecycleOwner, один раз на процесс). Ставится
+        // после контроллера и очереди: догоняющий ON_START уже открытого приложения приходит сразу и
+        // должен застать контроллер с личностью из очереди. Процесс, поднятый в фоне, ON_START не
+        // получает — сессии нет. Без контроллера (после destroy) события лишь двигают общий трекер.
+        ProcessForegroundWatcher.install(
+            onStart = {
+                val c = controller
+                // Без контроллера отметка не уходит: запуск не считается сообщённым.
+                if (c != null) c.onProcessForeground() else AppSessionTracker.shared.processStarted(canReport = false)
+            },
+            onStop = {
+                val c = controller
+                if (c != null) c.onProcessBackground() else AppSessionTracker.shared.wentBackground()
+            },
+        )
     }
 
     @JvmStatic
@@ -189,13 +213,19 @@ object Respondo {
         controller?.setCurrentScreen(name)
     }
 
-    /** Сообщает SDK о переходе приложения в фон (отпустить WS, разрешить push-доставку). */
+    /**
+     * Сообщает SDK о переходе приложения в фон (отпустить WS, разрешить push-доставку). Только реалтайм:
+     * сессии приложения SDK считает сам по `ProcessLifecycleOwner`, этот вызов на них не влияет.
+     */
     @JvmStatic
     fun onBackground() {
         controller?.onBackground()
     }
 
-    /** Сообщает SDK о возврате приложения на передний план. */
+    /**
+     * Сообщает SDK о возврате приложения на передний план (восстановить WS). Только реалтайм: сессии
+     * приложения SDK считает сам по `ProcessLifecycleOwner`, этот вызов на них не влияет.
+     */
     @JvmStatic
     fun onForeground() {
         controller?.onForeground()

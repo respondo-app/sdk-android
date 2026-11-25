@@ -155,7 +155,8 @@ class SurveyTargetingTest {
     @Test
     fun identifyFrame_declaresSurveyTargeting() {
         val json = respondoJson.encodeToString(IdentifyFrame.serializer(), IdentifyFrame(visitorId = "v"))
-        assertTrue(json, json.contains("\"features\":[\"survey_targeting\"]"))
+        // app_sessions: SDK сам сообщает сессии приложения — сервер не считает identify активностью.
+        assertTrue(json, json.contains("\"features\":[\"survey_targeting\",\"app_sessions\"]"))
         assertTrue(json, json.contains("\"platform\":\"app\""))
     }
 

@@ -4,6 +4,7 @@ import ai.respondo.sdk.core.ChatMessage
 import ai.respondo.sdk.core.MessageRole
 import ai.respondo.sdk.core.SendStatus
 import ai.respondo.sdk.core.isImage
+import ai.respondo.sdk.i18n.MessageDateFormatter
 import ai.respondo.sdk.i18n.Strings
 import ai.respondo.sdk.theme.BrandColor
 import ai.respondo.sdk.transport.dto.ChatAttachmentDto
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -29,6 +31,29 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+
+/** Calendar-day separator in the local device timezone, matching the web thread. */
+@Composable
+internal fun MessageDateSeparator(createdAt: String?, lang: String) {
+    val date = MessageDateFormatter.parse(createdAt) ?: return
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Box(Modifier.weight(1f).height(1.dp).background(Color(0xFFE5E7EB)))
+        Text(
+            MessageDateFormatter.dayLabel(date, lang),
+            fontSize = 11.sp,
+            color = mutedColor(),
+            modifier = Modifier
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color(0xFFF9FAFB))
+                .padding(horizontal = 10.dp, vertical = 4.dp),
+        )
+        Box(Modifier.weight(1f).height(1.dp).background(Color(0xFFE5E7EB)))
+    }
+}
 
 /**
  * Пузырь сообщения: пользователь справа (primary), ассистент/оператор слева (светлый пузырь),
@@ -73,15 +98,27 @@ private fun UserBubble(
                 )
             }
             AttachmentList(message.attachments, onImageClick)
-            when (message.sendStatus) {
-                SendStatus.SENDING -> Text(Strings.get(lang, "typingIndicator"), fontSize = 11.sp, color = mutedColor())
-                SendStatus.FAILED -> Text(
-                    text = Strings.get(lang, "sendFailed"),
-                    fontSize = 11.sp,
-                    color = Color(0xFFDC2626),
-                    modifier = Modifier.clickable { onRetry(message.id) }.padding(top = 2.dp),
-                )
-                SendStatus.SENT, SendStatus.NONE -> Unit
+            val time = message.createdAt?.let { MessageDateFormatter.timeLabel(it, lang) }
+            if (time != null || message.sendStatus != SendStatus.NONE) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.End) {
+                    if (time != null) {
+                        Text(time, fontSize = 10.sp, color = mutedColor())
+                    }
+                    if (time != null && message.sendStatus != SendStatus.NONE) {
+                        Text("  ", fontSize = 10.sp)
+                    }
+                    when (message.sendStatus) {
+                        SendStatus.SENDING -> Text(Strings.get(lang, "typingIndicator"), fontSize = 11.sp, color = mutedColor())
+                        SendStatus.FAILED -> Text(
+                            text = Strings.get(lang, "sendFailed"),
+                            fontSize = 11.sp,
+                            color = Color(0xFFDC2626),
+                            modifier = Modifier.clickable { onRetry(message.id) }.padding(top = 2.dp),
+                        )
+                        SendStatus.SENT -> Unit
+                        SendStatus.NONE -> Unit
+                    }
+                }
             }
         }
     }
@@ -106,7 +143,14 @@ private fun AssistantBubble(
         }
         Column(modifier = Modifier.padding(start = 8.dp).widthIn(max = 280.dp)) {
             if (message.authorName != null) {
-                Text(message.authorName, fontSize = 11.sp, fontWeight = FontWeight.Medium, color = mutedColor())
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(message.authorName, fontSize = 11.sp, fontWeight = FontWeight.Medium, color = mutedColor())
+                    message.createdAt?.let { createdAt ->
+                        MessageDateFormatter.timeLabel(createdAt, lang)?.let { label ->
+                            Text(label, fontSize = 10.sp, color = mutedColor())
+                        }
+                    }
+                }
             }
             if (message.content.isNotEmpty()) {
                 Box(
@@ -127,6 +171,13 @@ private fun AssistantBubble(
             }
             AttachmentList(message.attachments, onImageClick)
             SourcesRow(message, lang, linkColor, onLinkClick)
+            if (message.authorName == null) {
+                message.createdAt?.let { createdAt ->
+                    MessageDateFormatter.timeLabel(createdAt, lang)?.let { label ->
+                        Text(label, fontSize = 10.sp, color = mutedColor())
+                    }
+                }
+            }
             DocLinksRow(docLinks, lang, onLinkClick)
             if (message.deliveryStatus == "delivered") {
                 Text("✓✓ ${Strings.get(lang, "readReceipt")}", fontSize = 10.sp, color = mutedColor())
@@ -182,6 +233,7 @@ private fun SourcesRow(message: ChatMessage, lang: String, linkColor: Color, onL
         Text(Strings.get(lang, "sourcesLabel") + ":", fontSize = 11.sp, color = mutedColor())
         for (src in message.sources) {
             val url = src.url ?: continue
+            if (!ai.respondo.sdk.core.UrlSafety.isHttp(url)) continue
             Text(
                 text = src.title ?: url,
                 fontSize = 12.sp,
@@ -199,6 +251,7 @@ private fun DocLinksRow(docLinks: List<DocLinkDto>, lang: String, onLinkClick: (
         Text(Strings.get(lang, "docLinksLabel") + ":", fontSize = 11.sp, color = mutedColor())
         for (link in docLinks) {
             val url = link.url ?: continue
+            if (!ai.respondo.sdk.core.UrlSafety.isHttp(url)) continue
             Text(
                 text = link.title ?: url,
                 fontSize = 12.sp,

@@ -3,6 +3,7 @@ package ai.respondo.sdk.ui
 import ai.respondo.sdk.core.ControllerLogic
 import ai.respondo.sdk.core.MessageRole
 import ai.respondo.sdk.core.RespondoController
+import ai.respondo.sdk.i18n.MessageDateFormatter
 import ai.respondo.sdk.i18n.Strings
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,7 +13,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -24,13 +25,14 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.snapshotFlow
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.Alignment
@@ -41,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -62,6 +65,10 @@ internal fun ChatScreen(controller: RespondoController) {
     val pendingAttachments by controller.pendingAttachments.collectAsState()
     val hasMoreHistory by controller.hasMoreHistory.collectAsState()
     val messageError by controller.messageError.collectAsState()
+    val rating by controller.rating.collectAsState()
+    val ratingVisible by controller.ratingVisible.collectAsState()
+    val ratingSaving by controller.ratingSaving.collectAsState()
+    val remarkSaving by controller.remarkSaving.collectAsState()
 
     // rememberSaveable — переживает пересоздание (поворот экрана): черновик и открытый лайтбокс не теряются.
     var composerText by rememberSaveable { mutableStateOf("") }
@@ -110,8 +117,12 @@ internal fun ChatScreen(controller: RespondoController) {
         lastScrolledId = lastMessageId
     }
     // Пагинация истории при скролле к верху.
-    LaunchedEffect(listState.firstVisibleItemIndex) {
-        if (listState.firstVisibleItemIndex == 0 && hasMoreHistory) controller.loadMoreHistory()
+    LaunchedEffect(listState, hasMoreHistory) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .distinctUntilChanged()
+            .collect { firstVisibleItemIndex ->
+                if (firstVisibleItemIndex == 0 && hasMoreHistory) controller.loadMoreHistory()
+            }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -139,16 +150,43 @@ internal fun ChatScreen(controller: RespondoController) {
 
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
-                items(messages, key = { it.id }) { message ->
-                    MessageBubble(
-                        message = message,
-                        lang = lang,
-                        linkColor = theme.linkColorArgb.toComposeColor(),
-                        docLinks = docLinks[message.id].orEmpty(),
-                        onImageClick = { lightboxUrl = it.url },
-                        onRetry = { controller.retry(it) },
-                        onLinkClick = { url -> if (!controller.onUrlRequested(url)) openExternally(context, url) },
-                    )
+                itemsIndexed(messages, key = { _, message -> message.id }) { index, message ->
+                    val currentDay = MessageDateFormatter.parse(message.createdAt)?.let { MessageDateFormatter.dayKey(it) }
+                    val previousDay = if (index == 0) null else {
+                        MessageDateFormatter.parse(messages[index - 1].createdAt)?.let { MessageDateFormatter.dayKey(it) }
+                    }
+                    Column {
+                        if (currentDay != null && currentDay != previousDay) {
+                            MessageDateSeparator(message.createdAt, lang)
+                        }
+                        MessageBubble(
+                            message = message,
+                            lang = lang,
+                            linkColor = theme.linkColorArgb.toComposeColor(),
+                            docLinks = docLinks[message.id].orEmpty(),
+                            onImageClick = { lightboxUrl = it.url },
+                            onRetry = { controller.retry(it) },
+                            onLinkClick = { url -> if (!controller.onUrlRequested(url)) openExternally(context, url) },
+                        )
+                    }
+                }
+                // Оценка беседы (behavior.md §12) — последней строкой ленты, только под закрытой
+                // беседой, чьё закрытие попросило оценку.
+                if (ratingVisible) {
+                    item(key = "rating") {
+                        RatingBlock(
+                            rating = rating,
+                            primary = theme.primaryColorArgb.toComposeColor(),
+                            onPrimary = theme.onPrimaryArgb.toComposeColor(),
+                            saving = ratingSaving,
+                            remarkSaving = remarkSaving,
+                            label = { controller.ratingLabel(it) },
+                            onRate = { controller.rate(it) },
+                            onSendRemark = { text, done -> controller.sendRemark(text, done) },
+                            onEditRemark = { controller.editRemark() },
+                            onCancelEdit = { controller.cancelRemarkEdit() },
+                        )
+                    }
                 }
                 if (typing != null) item { TypingRow(typing?.authorName, lang) }
                 if (isLoading) item { LoadingRow() }
@@ -158,9 +196,9 @@ internal fun ChatScreen(controller: RespondoController) {
         // Быстрые вопросы (тред без пользовательских сообщений) или предложенные вопросы.
         val hasUserMessage = messages.any { it.role == MessageRole.USER }
         if (!hasUserMessage && theme.quickQuestions.isNotEmpty()) {
-            QuestionChips(theme.quickQuestions) { controller.sendMessage(it) }
+            QuestionChips(theme.quickQuestions) { controller.sendQuickQuestion(it) }
         } else if (suggested.isNotEmpty()) {
-            QuestionChips(suggested) { controller.sendMessage(it) }
+            QuestionChips(suggested) { controller.sendSuggestion(it) }
         }
 
         PendingAttachmentsRow(pendingAttachments.map { it.filename }, onRemove = { name ->

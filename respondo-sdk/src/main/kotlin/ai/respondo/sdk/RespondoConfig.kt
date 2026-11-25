@@ -6,8 +6,8 @@ package ai.respondo.sdk
  * [agentId] обязателен всегда (непустой): SDK не поддерживает humans-only сценарий без агента.
  *
  * @property agentId id AI-агента; обязателен и непуст.
- * @property channelId id widget-канала (интеграции). Передаётся в запросы как `channel_id`;
- *   заменяет legacy-алиас `integrationId` из веба.
+ * @property channelId id канала Mobile SDK (Settings › Channels в дашборде). Передаётся в запросы
+ *   как `channel_id`; заменяет legacy-алиас `integrationId` из веба.
  * @property baseUrl базовый URL API; при `null` → `https://api.respondo.ai`. WS-хост выводится из него.
  * @property locale BCP-47 (напр. `"ru"` / `"en"`); при `null` берётся системная локаль устройства.
  *   Управляет и языком строк UI, и параметром `lang` запроса конфигурации.

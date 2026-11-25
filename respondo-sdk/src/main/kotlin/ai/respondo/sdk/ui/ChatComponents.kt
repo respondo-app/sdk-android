@@ -1,6 +1,8 @@
 package ai.respondo.sdk.ui
 
+import ai.respondo.sdk.core.ConversationRating
 import ai.respondo.sdk.core.EmailValidator
+import ai.respondo.sdk.core.RemarkStep
 import ai.respondo.sdk.i18n.Strings
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -21,10 +23,16 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -32,8 +40,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -191,5 +207,133 @@ internal fun EmailCollectorView(lang: String, onSubmit: (String) -> Unit) {
 internal fun LoadingRow() {
     Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
         CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+    }
+}
+
+/** Потолок отзыва — как у сервера (conversation.MaxRemarkRunes). */
+internal const val REMARK_MAX = 1000
+
+/**
+ * Оценка беседы (behavior.md §12): «How was your experience?» и пять кружков 1–5 в конце ленты
+ * закрытой беседы, выбранный — цветом бренда. После выбора — «спасибо» и необязательный отзыв
+ * («Tell us more»): поле на 3 строки и Send цветом бренда; без Skip — не написать и есть пропуск.
+ * После отправки — отзыв одной строкой и Edit, пока правка доступна; Edit ставит курсор в поле,
+ * уход из поля без изменений возвращает строку отзыва. Без эмодзи — только цифры.
+ */
+@Composable
+internal fun RatingBlock(
+    rating: ConversationRating,
+    primary: Color,
+    onPrimary: Color,
+    saving: Boolean,
+    remarkSaving: Boolean,
+    label: (String) -> String,
+    onRate: (Int) -> Unit,
+    onSendRemark: (String, (Boolean) -> Unit) -> Unit,
+    onEditRemark: () -> Unit,
+    onCancelEdit: () -> Unit,
+) {
+    var draft by remember { mutableStateOf("") }
+    val remarkFocus = remember { FocusRequester() }
+    var remarkFocused by remember { mutableStateOf(false) }
+    // Правка начинается с сохранённого отзыва, курсор — в поле.
+    LaunchedEffect(rating.remarkStep) {
+        if (rating.remarkStep == RemarkStep.EDITING) {
+            draft = rating.remark
+            runCatching { remarkFocus.requestFocus() }
+        }
+    }
+    val ink = Color(0xFF1C2024)
+    val border = Color(0xFFD9D9E0)
+    val typing = rating.remarkStep == RemarkStep.OPEN || rating.remarkStep == RemarkStep.EDITING
+    val canSend = !remarkSaving && draft.trim().isNotEmpty() && draft.trim() != rating.remark
+
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(label("ratingQuestion"), fontSize = 14.sp, fontWeight = FontWeight.Medium, color = ink)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            for (n in 1..5) {
+                val on = rating.value == n
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(CircleShape)
+                        .background(if (on) primary else Color.White)
+                        .border(1.dp, if (on) primary else border, CircleShape)
+                        .clickable(enabled = !saving) { onRate(n) }
+                        .semantics {
+                            contentDescription = "$n / 5"
+                            selected = on
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("$n", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = if (on) onPrimary else ink)
+                }
+            }
+        }
+        if (rating.value > 0) {
+            Text(label("ratingThanks"), fontSize = 12.sp, color = Color(0xFF60646C))
+        }
+        if (rating.remarkVisible && typing && rating.remarkEditable) {
+            Column(modifier = Modifier.widthIn(max = 320.dp).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(label("ratingRemarkPrompt"), fontSize = 12.sp, fontWeight = FontWeight.Medium, color = ink)
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { if (it.codePointCount(0, it.length) <= REMARK_MAX) draft = it },
+                    placeholder = { Text(label("ratingRemarkPlaceholder")) },
+                    minLines = 3,
+                    maxLines = 3,
+                    enabled = !remarkSaving,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(remarkFocus)
+                        .onFocusChanged { state ->
+                            // Поле правки покинули без изменений — назад к строке отзыва.
+                            val left = remarkFocused && !state.isFocused
+                            remarkFocused = state.isFocused
+                            if (left && rating.remarkStep == RemarkStep.EDITING && !remarkSaving &&
+                                draft.trim() == rating.remark
+                            ) {
+                                onCancelEdit()
+                            }
+                        },
+                )
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    Button(
+                        onClick = { onSendRemark(draft.trim()) { ok -> if (ok) draft = "" } },
+                        enabled = canSend,
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = primary, contentColor = onPrimary),
+                    ) { Text(label("ratingSend")) }
+                }
+            }
+        }
+        if (rating.value > 0 && rating.remarkStep == RemarkStep.SENT && rating.remark.isNotEmpty()) {
+            Row(
+                modifier = Modifier.widthIn(max = 320.dp).fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    rating.remark,
+                    fontSize = 14.sp,
+                    color = ink,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                if (rating.remarkEditable) {
+                    OutlinedButton(
+                        onClick = onEditRemark,
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, border),
+                    ) { Text(label("ratingEdit"), fontSize = 12.sp, color = ink) }
+                }
+            }
+        }
     }
 }

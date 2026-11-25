@@ -3,9 +3,12 @@ package ai.respondo.sdk.ui
 import ai.respondo.sdk.core.MarkdownRenderer
 import ai.respondo.sdk.core.RichBlock
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.LinkInteractionListener
@@ -17,6 +20,7 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 private val CODE_BACKGROUND = Color(0x14000000)
@@ -38,10 +42,15 @@ internal fun RichMessageText(
     val rich = remember(content, isHtml) { MarkdownRenderer.render(content, isHtml) }
     Column {
         for (block in rich.blocks) {
+            // Отступ абзаца: пустая строка markdown между блоками — половина строки.
+            if (block is RichBlock.Gap) {
+                Spacer(Modifier.height((fontSize / 2).dp))
+                continue
+            }
             val prefix = when (block) {
                 is RichBlock.Bullet -> "•  "
                 is RichBlock.Ordered -> "${block.number}.  "
-                is RichBlock.Paragraph -> ""
+                is RichBlock.Paragraph, is RichBlock.Gap -> ""
             }
             val annotated = buildAnnotatedString {
                 if (prefix.isNotEmpty()) append(prefix)

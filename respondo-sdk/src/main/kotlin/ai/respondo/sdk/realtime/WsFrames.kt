@@ -26,12 +26,19 @@ data class IdentifyFrame(
     @SerialName("user_hash") val userHash: String? = null,
     val lang: String? = null,
     @SerialName("conversation_id") val conversationId: String? = null,
-    /** Возможности клиента: SDK сам исполняет таргетинг опросов — серверу можно пушить таргетированные. */
-    @EncodeDefault(EncodeDefault.Mode.ALWAYS) val features: List<String> = listOf(SurveyTargeting.FEATURE),
+    /**
+     * Возможности клиента: SDK сам исполняет таргетинг опросов — серверу можно пушить таргетированные;
+     * SDK сам сообщает сессии приложения (`POST /widget/app-session`) — сервер не считает этот identify
+     * активностью (процесс мог подняться в фоне).
+     */
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS) val features: List<String> = listOf(SurveyTargeting.FEATURE, APP_SESSIONS_FEATURE),
     /** Где работает клиент: опрос «только сайт» приложению не пушится. */
     @EncodeDefault(EncodeDefault.Mode.ALWAYS) val platform: String = SurveyTargeting.CLIENT_PLATFORM,
     @EncodeDefault(EncodeDefault.Mode.ALWAYS) val type: String = "identify",
 )
+
+/** Возможность WS identify: SDK сам сообщает сессии приложения (`/widget/app-session`). */
+const val APP_SESSIONS_FEATURE: String = "app_sessions"
 
 /** Подписка на живой поток событий конкретной беседы (после создания беседы). */
 @Serializable
